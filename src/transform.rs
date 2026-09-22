@@ -34,8 +34,14 @@ pub fn transpile(filename: &str, source: &str) -> Result<(String, Option<String>
     let _ = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
 
-    // 4. Codegen into JavaScript string
-    let codegen_ret = Codegen::new().build(&program);
+    // 4. Codegen into JavaScript string with source map
+    let codegen_options = oxc::codegen::CodegenOptions {
+        source_map_path: Some(path.to_path_buf()),
+        ..oxc::codegen::CodegenOptions::default()
+    };
+    let codegen_ret = Codegen::new()
+        .with_options(codegen_options)
+        .build(&program);
 
     Ok((codegen_ret.code, codegen_ret.map.map(|sm| sm.to_json_string())))
 }
@@ -62,5 +68,11 @@ mod tests {
         let (code, _) = transpile("test.tsx", "const App = (): string => <h1>Hello</h1>;").unwrap();
         assert!(!code.contains(": string"));
         assert!(!code.contains("<h1>"));
+    }
+
+    #[test]
+    fn test_sourcemap() {
+        let (_, map) = transpile("test.ts", "const x: number = 42;").unwrap();
+        println!("Map is: {:?}", map);
     }
 }

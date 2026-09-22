@@ -11,6 +11,7 @@ use axum::{
 };
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -28,6 +29,7 @@ struct AppState {
     root: PathBuf,
     tx: broadcast::Sender<String>,
     graph: Arc<RwLock<hmr::ModuleGraph>>,
+    source_maps: Arc<RwLock<HashMap<String, String>>>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
@@ -129,10 +131,45 @@ async fn request_middleware(
 
     let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
 
+    // Phase 5: Serve in-memory source map
+    if path.ends_with(".map") {
+        let map_key = hmr::normalize_path(rel_path);
+        if let Some(map_json) = state.source_maps.read().unwrap().get(&map_key).cloned() {
+            return ([(header::CONTENT_TYPE, "application/json")], map_json).into_response();
+        }
+    }
+
     // HTML: inject HMR client script
     if target.is_file() && ext == "html" {
         if let Ok(content) = tokio::fs::read_to_string(&target).await {
             return Html(inject_hmr(&content)).into_response();
+        }
+    }
+
+    // Phase 5: JSON modules: export default { ... }
+    // ponytail: one format!() wrap. No JSON re-serialization needed.
+    if target.is_file() && ext == "json" {
+        if let Ok(content) = tokio::fs::read_to_string(&target).await {
+            let code = format!("export default {};\n", content.trim());
+            return ([(header::CONTENT_TYPE, "application/javascript")], code).into_response();
+        }
+    }
+
+    // Phase 5: Static assets imported as JS module
+    const ASSET_EXTS: &[&str] = &[
+        "png", "jpg", "jpeg", "gif", "svg", "webp", "ico",
+        "woff", "woff2", "ttf", "eot",
+        "mp4", "webm", "ogg", "mp3", "wav",
+        "pdf",
+    ];
+    if target.is_file() && ASSET_EXTS.contains(&ext) {
+        let is_module_import = req.headers().get("sec-fetch-dest").and_then(|v| v.to_str().ok()) == Some("script")
+            || req.uri().query().map(|q| q.contains("import")).unwrap_or(false);
+
+        if is_module_import {
+            let url = hmr::normalize_path(rel_path);
+            let code = format!("export default \"{url}\";\n");
+            return ([(header::CONTENT_TYPE, "application/javascript")], code).into_response();
         }
     }
 
@@ -165,7 +202,13 @@ async fn request_middleware(
                     let rewritten = resolve::rewrite_bare_imports(&code, &fname, "/node_modules/.rush/deps");
                     // Phase 4: Inject import.meta.hot preamble
                     let mod_path = hmr::normalize_path(rel_path);
-                    let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
+                    let mut with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
+                    // Phase 5: Cache source map and append sourceMappingURL
+                    if let Some(map_json) = _map {
+                        let map_path = format!("{mod_path}.map");
+                        state.source_maps.write().unwrap().insert(map_path.clone(), map_json);
+                        with_hmr.push_str(&format!("\n//# sourceMappingURL={map_path}\n"));
+                    }
                     return ([(header::CONTENT_TYPE, "application/javascript")], with_hmr)
                         .into_response();
                 }
@@ -333,10 +376,13 @@ async fn main() {
         }
     });
 
+    let source_maps = Arc::new(RwLock::new(HashMap::new()));
+
     let state = AppState {
         root: root.clone(),
         tx,
         graph,
+        source_maps,
     };
 
     let app = Router::new()
