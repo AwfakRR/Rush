@@ -1,18 +1,38 @@
-# Rush ⚡
+<p align="center">
+  <img src="assets/logo.png" alt="Rush Logo" width="150" />
+</p>
 
-A blazingly fast, minimalist dev server written in Rust, built with the **Ponytail philosophy** (the simplest, shortest, most efficient solution that works).
+<h1 align="center">Rush</h1>
 
-Rush provides instant local web development with on-the-fly TypeScript/JSX transpilation, debounced file watching, WebSocket-based live reload, and CSS hot swapping — all without the overhead of heavy JavaScript runtimes or multi-megabyte dependency trees.
+<p align="center">
+  <b>A blazingly fast, minimalist dev server written in Rust.</b><br/>
+  Built with the <i>Ponytail philosophy</i> (the simplest, shortest, most efficient solution that works).
+</p>
+
+<p align="center">
+  <a href="#features">Features</a> •
+  <a href="#quick-start">Quick Start</a> •
+  <a href="#cli-options">CLI Options</a> •
+  <a href="#example-project">Example</a> •
+  <a href="#architecture--ponytail-engineering">Architecture</a> •
+  <a href="#roadmap">Roadmap</a> •
+  <a href="#license">License</a>
+</p>
 
 ---
+
+Rush provides instant local web development with on-the-fly TypeScript/JSX transpilation, debounced file watching, WebSocket-based live reload, and CSS hot swapping — all without the overhead of heavy JavaScript runtimes or multi-megabyte dependency trees.
 
 ## Features
 
 - **⚡ Sub-millisecond Transpilation**: Instant on-the-fly TypeScript (`.ts`), TSX (`.tsx`), and JSX (`.jsx`) transpilation powered by [`oxc`](https://github.com/oxc-project/oxc) — the high-performance Rust toolchain behind Rolldown.
 - **🔄 Live Reload & CSS Hot Swap**: WebSocket connection automatically reloads the browser on file saves. Changes to `.css` files hot-swap stylesheets instantly without losing page state or triggering a full refresh.
+- **🔥 Granular Module HMR**: Supports `import.meta.hot.accept()` and dependency graph boundary resolution to update individual JS/TS modules in-place.
+- **📦 Bare Import Resolution & Pre-bundling**: Rewrites bare npm specifiers (`import React from 'react'`) and automatically pre-bundles CommonJS/ESM dependencies with `esbuild`.
+- **🗺️ Standard v3 Source Maps**: Generates and serves in-memory source maps (`.map`) for seamless in-browser debugging of original TypeScript source.
+- **📄 JSON & Static Asset Modules**: Import JSON files directly as default objects, and static media files (`.png`, `.svg`, etc.) as URL strings.
 - **🛡️ Debounced File Watching**: 50ms debouncer coalesces IDE and editor atomic saves into single clean reload triggers.
 - **💉 Zero-Config HTML Injection**: Automatically injects the lightweight client runtime into `<head>` before serving HTML documents.
-- **📦 High-Performance Static Serving**: Async HTTP file serving with streaming and range support backed by `axum` and `tower-http`.
 - **✂️ Minimal Dependency Footprint**: Built with just 5 core Rust crates, prioritizing standard library APIs and native platform features over dependency bloat.
 
 ---
@@ -62,7 +82,8 @@ example/
 ├── index.html     # HTML entry point (Rush injects client script)
 ├── style.css      # Stylesheet (hot-swapped on save)
 ├── main.js        # JavaScript application code
-└── counter.ts     # TypeScript file transpiled on-the-fly to JS
+├── counter.ts     # TypeScript file with import.meta.hot.accept()
+└── config.json    # JSON module imported directly into JS
 ```
 
 Start the demo server:
