@@ -4,6 +4,9 @@ use oxc::{
     parser::Parser,
     span::SourceType,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::{hash_map::DefaultHasher, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Check if an import specifier is a bare package name (not relative, absolute, or external URL).
@@ -114,6 +117,158 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
     None
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DepCache {
+    pub hash: String,
+    pub deps: Vec<String>,
+}
+
+/// Compute a fast hash over all lockfiles and package.json to detect dependency changes.
+/// ponytail: DefaultHasher, no crypto crate needed for cache invalidation.
+pub fn lockfile_hash(root: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    for name in ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package.json"] {
+        let p = root.join(name);
+        if let Ok(bytes) = std::fs::read(&p) {
+            bytes.hash(&mut hasher);
+        }
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Scan a directory recursively for bare imports across all source files.
+/// ponytail: simple std::fs::read_dir recursion, skips noise dirs without heavy walkdir/glob crates.
+pub fn scan_dir_for_bare_imports(root: &Path, dir: &Path, bare: &mut HashSet<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name == "node_modules" || name == ".git" || name == "target" || name.starts_with('.') {
+                continue;
+            }
+            scan_dir_for_bare_imports(root, &path, bare);
+        } else if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
+                if let Ok(source) = std::fs::read_to_string(&path) {
+                    let fname = path.file_name().unwrap().to_string_lossy().to_string();
+                    for (spec, _, _) in scan_imports(&source, &fname) {
+                        if is_bare(&spec) {
+                            bare.insert(spec);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Find esbuild executable in local node_modules or system PATH.
+pub fn find_esbuild(root: &Path) -> Result<String, String> {
+    // 1. Check local node_modules/.bin
+    for bin in ["esbuild.cmd", "esbuild.exe", "esbuild"] {
+        let local = root.join("node_modules").join(".bin").join(bin);
+        if local.exists() {
+            return Ok(local.to_string_lossy().to_string());
+        }
+    }
+
+    // 2. Check if esbuild is available on system PATH
+    if std::process::Command::new("esbuild").arg("--version").output().is_ok() {
+        return Ok("esbuild".to_string());
+    }
+
+    Err("esbuild not found. Install it with: npm install -D esbuild".to_string())
+}
+
+/// Pre-bundle discovered node_modules dependencies into ESM files using esbuild.
+/// ponytail: shells out to esbuild binary — don't reinvent a JavaScript bundler.
+pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
+    let deps_dir = root.join("node_modules").join(".rush").join("deps");
+    let cache_file = deps_dir.join("_cache.json");
+    let current_hash = lockfile_hash(root);
+
+    // 1. Check if existing cache is still fresh
+    if let Ok(raw) = std::fs::read_to_string(&cache_file) {
+        if let Ok(cache) = serde_json::from_str::<DepCache>(&raw) {
+            if cache.hash == current_hash {
+                return Ok(Some(cache));
+            }
+        }
+    }
+
+    // 2. Scan all project files for bare imports
+    let mut bare_set = HashSet::new();
+    scan_dir_for_bare_imports(root, root, &mut bare_set);
+
+    if bare_set.is_empty() {
+        return Ok(None);
+    }
+
+    // 3. Resolve entry points in node_modules
+    let mut entries = Vec::new();
+    for pkg in &bare_set {
+        if let Some(entry_file) = resolve_package_entry(root, pkg) {
+            let out_name = pkg.replace('/', "__");
+            entries.push((out_name, entry_file));
+        } else {
+            eprintln!("[rush] warning: could not resolve entry for package '{pkg}'");
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    // 4. Shell out to esbuild
+    let esbuild_bin = find_esbuild(root)?;
+    std::fs::create_dir_all(&deps_dir).map_err(|e| e.to_string())?;
+
+    let mut cmd = std::process::Command::new(&esbuild_bin);
+    cmd.current_dir(root);
+
+    // Pass entry points: <out_name>=<entry_path>
+    for (out_name, entry_path) in &entries {
+        cmd.arg(format!("{}={}", out_name, entry_path.display()));
+    }
+
+    cmd.args([
+        "--bundle",
+        "--format=esm",
+        "--splitting",
+        "--platform=browser",
+        "--target=es2020",
+        &format!("--outdir={}", deps_dir.display()),
+        "--sourcemap",
+    ]);
+
+    let output = cmd.output().map_err(|e| format!("Failed to run esbuild: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("esbuild bundling error:\n{stderr}"));
+    }
+
+    // 5. Save cache metadata
+    let mut deps_list: Vec<String> = bare_set.into_iter().collect();
+    deps_list.sort();
+    let cache = DepCache {
+        hash: current_hash,
+        deps: deps_list,
+    };
+
+    if let Ok(json) = serde_json::to_string_pretty(&cache) {
+        let _ = std::fs::write(&cache_file, json);
+    }
+
+    println!("[rush] pre-bundled {} dependencies into {}", cache.deps.len(), deps_dir.display());
+    Ok(Some(cache))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +304,20 @@ export * from 'lodash-es';"#;
         let code = r#"import { useQuery } from '@tanstack/react-query';"#;
         let rewritten = rewrite_bare_imports(code, "app.js", "/node_modules/.rush/deps");
         assert!(rewritten.contains(r#"from "/node_modules/.rush/deps/@tanstack__react-query.js";"#));
+    }
+
+    #[test]
+    fn test_lockfile_hash() {
+        let hash1 = lockfile_hash(Path::new("."));
+        let hash2 = lockfile_hash(Path::new("."));
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 16);
+    }
+
+    #[test]
+    fn test_scan_dir_for_bare_imports() {
+        let mut bare = HashSet::new();
+        scan_dir_for_bare_imports(Path::new("example"), Path::new("example"), &mut bare);
+        assert!(bare.contains("canvas-confetti"));
     }
 }

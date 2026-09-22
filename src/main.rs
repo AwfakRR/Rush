@@ -192,6 +192,11 @@ async fn main() {
         }
     };
 
+    // Phase 3: Pre-bundle node_modules dependencies via esbuild
+    if let Err(e) = resolve::prebundle(&root) {
+        eprintln!("[rush] prebundle notice: {e}");
+    }
+
     let (tx, _rx) = broadcast::channel::<String>(16);
 
     // Spawn debounced file watcher in background thread
