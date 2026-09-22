@@ -94,7 +94,7 @@ Rush follows strict **Ponytail engineering principles**:
 - [x] **Phase 1**: On-the-fly TypeScript / JSX / TSX Transpilation (`oxc`)
 - [x] **Phase 2**: Bare Import Resolution (rewrite `import React from 'react'` for browsers)
 - [x] **Phase 3**: Dependency Pre-bundling (bundle `node_modules` dependencies into ESM via `esbuild`)
-- [ ] **Phase 4**: Granular `import.meta.hot` module-level HMR
+- [x] **Phase 4**: Granular `import.meta.hot` module-level HMR
 - [ ] **Phase 5**: JSON & Static Asset imports, Source Maps
 
 ---

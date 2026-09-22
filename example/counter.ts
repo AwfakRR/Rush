@@ -9,3 +9,9 @@ export function createCounter(initial: number = 0): { increment: () => number; g
     get: (): number => count,
   };
 }
+
+if (import.meta.hot) {
+  import.meta.hot.accept((newMod) => {
+    console.log('[example] counter.ts hot updated!', newMod);
+  });
+}

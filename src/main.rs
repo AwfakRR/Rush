@@ -13,6 +13,7 @@ use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::sync::broadcast;
@@ -20,26 +21,55 @@ use tower_http::services::ServeDir;
 
 mod transform;
 mod resolve;
+mod hmr;
 
 #[derive(Clone)]
 struct AppState {
     root: PathBuf,
     tx: broadcast::Sender<String>,
+    graph: Arc<RwLock<hmr::ModuleGraph>>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
   const socket = new WebSocket(`ws://${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
   socket.addEventListener('message', ({ data }) => {
-    console.log('[rush] update:', data);
-    if (data.endsWith('.css') || data.startsWith('css:')) {
+    let msg;
+    try {
+      msg = JSON.parse(data);
+    } catch {
+      msg = { type: data.endsWith('.css') ? 'css' : 'full-reload', path: data };
+    }
+
+    if (msg.type === 'css') {
+      console.log('[rush] css update:', msg.path);
       const links = document.querySelectorAll('link[rel="stylesheet"]');
       for (const link of links) {
         const url = new URL(link.href);
         url.searchParams.set('t', Date.now());
         link.href = url.href;
       }
+    } else if (msg.type === 'js-update') {
+      console.log('[rush] hot update:', msg.path);
+      const ctx = window.__rush_hot?.get(msg.path);
+      if (ctx?._disposeCallbacks) {
+        for (const cb of ctx._disposeCallbacks) {
+          try { cb(ctx.data); } catch (e) { console.error(e); }
+        }
+        ctx._disposeCallbacks = [];
+      }
+      import(`${msg.path}?t=${msg.timestamp}`).then(newMod => {
+        if (ctx?._acceptCallbacks) {
+          for (const cb of ctx._acceptCallbacks) {
+            try { cb(newMod); } catch (e) { console.error(e); }
+          }
+        }
+      }).catch(err => {
+        console.error('[rush] hot update failed, reloading:', err);
+        location.reload();
+      });
     } else {
+      console.log('[rush] full reload');
       location.reload();
     }
   });
@@ -106,17 +136,37 @@ async fn request_middleware(
         }
     }
 
+    // Helper to register module dependencies into ModuleGraph
+    let register_module = |source: &str, fname: &str| {
+        let is_accepting = hmr::has_hot_accept(source);
+        let raw_imports = resolve::scan_imports(source, fname);
+        let parent = Path::new(rel_path).parent().unwrap_or(Path::new(""));
+        let mut deps = Vec::new();
+        for (spec, _, _) in raw_imports {
+            if spec.starts_with('.') {
+                let resolved = parent.join(spec);
+                deps.push(hmr::normalize_path(&resolved.to_string_lossy()));
+            }
+        }
+        let mod_path = hmr::normalize_path(rel_path);
+        state.graph.write().unwrap().update(&mod_path, &deps, is_accepting);
+    };
+
     // TS/TSX/JSX: transpile on the fly via oxc
     // ponytail: no caching of transpile results — files are small, oxc is microseconds.
     // Add in-memory cache if profiler says transpilation is the bottleneck.
     if target.is_file() && matches!(ext, "ts" | "tsx" | "jsx") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
+            register_module(&source, &fname);
             match transform::transpile(&fname, &source) {
                 Ok((code, _map)) => {
                     // Phase 2: Rewrite bare imports before serving to browser
                     let rewritten = resolve::rewrite_bare_imports(&code, &fname, "/node_modules/.rush/deps");
-                    return ([(header::CONTENT_TYPE, "application/javascript")], rewritten)
+                    // Phase 4: Inject import.meta.hot preamble
+                    let mod_path = hmr::normalize_path(rel_path);
+                    let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
+                    return ([(header::CONTENT_TYPE, "application/javascript")], with_hmr)
                         .into_response();
                 }
                 Err(e) => {
@@ -137,8 +187,12 @@ async fn request_middleware(
     if target.is_file() && ext == "js" {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
+            register_module(&source, &fname);
             let rewritten = resolve::rewrite_bare_imports(&source, &fname, "/node_modules/.rush/deps");
-            return ([(header::CONTENT_TYPE, "application/javascript")], rewritten)
+            // Phase 4: Inject import.meta.hot preamble
+            let mod_path = hmr::normalize_path(rel_path);
+            let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
+            return ([(header::CONTENT_TYPE, "application/javascript")], with_hmr)
                 .into_response();
         }
     }
@@ -198,10 +252,12 @@ async fn main() {
     }
 
     let (tx, _rx) = broadcast::channel::<String>(16);
+    let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
 
     // Spawn debounced file watcher in background thread
     let watcher_root = root.clone();
     let watcher_tx = tx.clone();
+    let watcher_graph = graph.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let mut debouncer = match new_debouncer(Duration::from_millis(50), sync_tx) {
@@ -230,8 +286,48 @@ async fn main() {
                         .to_string_lossy()
                         .replace('\\', "/");
 
-                    println!("[rush] changed: {}", rel);
-                    watcher_tx.send(rel).ok();
+                    let ext = event.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+
+                    if ext == "css" {
+                        println!("[rush] css update: {}", rel);
+                        let msg = serde_json::json!({
+                            "type": "css",
+                            "path": hmr::normalize_path(&rel),
+                            "timestamp": now,
+                        });
+                        watcher_tx.send(msg.to_string()).ok();
+                    } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
+                        let boundaries = watcher_graph.read().unwrap().find_update_boundaries(&rel);
+                        if let Some(targets) = boundaries {
+                            println!("[rush] hot update: {:?}", targets);
+                            for target in targets {
+                                let msg = serde_json::json!({
+                                    "type": "js-update",
+                                    "path": target,
+                                    "timestamp": now,
+                                });
+                                watcher_tx.send(msg.to_string()).ok();
+                            }
+                        } else {
+                            println!("[rush] reload: {}", rel);
+                            let msg = serde_json::json!({
+                                "type": "full-reload",
+                                "path": hmr::normalize_path(&rel),
+                            });
+                            watcher_tx.send(msg.to_string()).ok();
+                        }
+                    } else {
+                        println!("[rush] reload: {}", rel);
+                        let msg = serde_json::json!({
+                            "type": "full-reload",
+                            "path": hmr::normalize_path(&rel),
+                        });
+                        watcher_tx.send(msg.to_string()).ok();
+                    }
                 }
             }
         }
@@ -240,6 +336,7 @@ async fn main() {
     let state = AppState {
         root: root.clone(),
         tx,
+        graph,
     };
 
     let app = Router::new()
