@@ -11,3 +11,7 @@ notify-debouncer-mini = "0.5"
 
 # ponytail: unified umbrella crate with transformer, semantic, and codegen features
 oxc = { version = "0.151.0", features = ["transformer", "codegen", "semantic"] }
+
+# ponytail: already transitive deps of axum, 0 new compilation cost
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

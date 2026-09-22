@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 mod transform;
+mod resolve;
 
 #[derive(Clone)]
 struct AppState {
@@ -113,8 +114,9 @@ async fn request_middleware(
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
             match transform::transpile(&fname, &source) {
                 Ok((code, _map)) => {
-                    // ponytail: source maps deferred to Phase 5, serve JS only for now
-                    return ([(header::CONTENT_TYPE, "application/javascript")], code)
+                    // Phase 2: Rewrite bare imports before serving to browser
+                    let rewritten = resolve::rewrite_bare_imports(&code, &fname, "/node_modules/.rush/deps");
+                    return ([(header::CONTENT_TYPE, "application/javascript")], rewritten)
                         .into_response();
                 }
                 Err(e) => {
@@ -128,6 +130,16 @@ async fn request_middleware(
                         .into_response();
                 }
             }
+        }
+    }
+
+    // JS: rewrite bare imports for browser execution
+    if target.is_file() && ext == "js" {
+        if let Ok(source) = tokio::fs::read_to_string(&target).await {
+            let fname = target.file_name().unwrap().to_string_lossy().to_string();
+            let rewritten = resolve::rewrite_bare_imports(&source, &fname, "/node_modules/.rush/deps");
+            return ([(header::CONTENT_TYPE, "application/javascript")], rewritten)
+                .into_response();
         }
     }
 

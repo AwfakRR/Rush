@@ -1365,6 +1365,8 @@ dependencies = [
  "axum",
  "notify-debouncer-mini",
  "oxc",
+ "serde",
+ "serde_json",
  "tokio",
  "tower-http",
 ]

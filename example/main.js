@@ -1,8 +1,11 @@
-let count = 0;
+import { createCounter } from './counter.ts';
+import confetti from 'canvas-confetti';
+
+const counter = createCounter(0);
 const btn = document.getElementById('counter');
 
 btn.addEventListener('click', () => {
-  count++;
+  const count = counter.increment();
   btn.textContent = `Clicks: ${count}`;
 });
 
