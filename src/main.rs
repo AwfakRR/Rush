@@ -23,6 +23,9 @@ use tower_http::services::ServeDir;
 mod transform;
 mod resolve;
 mod hmr;
+mod log;
+mod env;
+mod alias;
 
 #[derive(Clone)]
 struct AppState {
@@ -30,9 +33,29 @@ struct AppState {
     tx: broadcast::Sender<String>,
     graph: Arc<RwLock<hmr::ModuleGraph>>,
     source_maps: Arc<RwLock<HashMap<String, String>>>,
+    env_vars: Arc<HashMap<String, String>>,
+    proxies: Arc<Vec<(String, String)>>,
+    aliases: Arc<Vec<(String, String)>>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
+  // Phase 7: Error overlay helpers
+  // ponytail: inline DOM creation, no framework, no shadow DOM. CSS scoped by id.
+  function showOverlay(msg) {
+    let el = document.getElementById('__rush_error');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = '__rush_error';
+      el.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,0.85);display:flex;align-items:center;justify-content:center;font-family:monospace';
+      el.innerHTML = '<div style="background:#1a1a2e;color:#fff;border:2px solid #e74c3c;border-radius:8px;padding:24px;max-width:80vw;max-height:80vh;overflow:auto;position:relative"><button style="position:absolute;top:8px;right:12px;background:none;border:none;color:#888;font-size:20px;cursor:pointer" onclick="this.parentElement.parentElement.remove()">×</button><h3 style="color:#e74c3c;margin:0 0 12px">🚨 Rush Build Error</h3><pre style="color:#ff6b6b;white-space:pre-wrap;word-break:break-word;margin:0;font-size:13px"></pre></div>';
+      document.body.appendChild(el);
+    }
+    el.querySelector('pre').textContent = msg;
+  }
+  function clearOverlay() {
+    document.getElementById('__rush_error')?.remove();
+  }
+
   const socket = new WebSocket(`ws://${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
   socket.addEventListener('message', ({ data }) => {
@@ -43,7 +66,11 @@ const HMR_CLIENT: &str = r#"(() => {
       msg = { type: data.endsWith('.css') ? 'css' : 'full-reload', path: data };
     }
 
-    if (msg.type === 'css') {
+    if (msg.type === 'error') {
+      console.error('[rush]', msg.message);
+      showOverlay(msg.file ? msg.file + '\n\n' + msg.message : msg.message);
+    } else if (msg.type === 'css') {
+      clearOverlay();
       console.log('[rush] css update:', msg.path);
       const links = document.querySelectorAll('link[rel="stylesheet"]');
       for (const link of links) {
@@ -52,6 +79,7 @@ const HMR_CLIENT: &str = r#"(() => {
         link.href = url.href;
       }
     } else if (msg.type === 'js-update') {
+      clearOverlay();
       console.log('[rush] hot update:', msg.path);
       const ctx = window.__rush_hot?.get(msg.path);
       if (ctx?._disposeCallbacks) {
@@ -71,6 +99,7 @@ const HMR_CLIENT: &str = r#"(() => {
         location.reload();
       });
     } else {
+      clearOverlay();
       console.log('[rush] full reload');
       location.reload();
     }
@@ -117,6 +146,37 @@ async fn request_middleware(
     next: Next,
 ) -> Response {
     let path = req.uri().path();
+
+    // Phase 10: Proxy forwarding — check before any file resolution
+    // ponytail: simple prefix match + reqwest forward, no streaming, no websocket proxy
+    for (prefix, target_url) in state.proxies.iter() {
+        if path.starts_with(prefix) {
+            let rest = &path[prefix.len()..];
+            let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+            let url = format!("{}{}{}", target_url.trim_end_matches('/'), rest, query);
+            let method = req.method().clone();
+
+            let client = reqwest::Client::new();
+            let proxy_req = client.request(method, &url);
+
+            match proxy_req.send().await {
+                Ok(resp) => {
+                    let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                        .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let body = resp.bytes().await.unwrap_or_default();
+                    return (status, body).into_response();
+                }
+                Err(e) => {
+                    log::error(&format!("proxy error: {e}"));
+                    return (
+                        axum::http::StatusCode::BAD_GATEWAY,
+                        format!("Proxy error: {e}"),
+                    ).into_response();
+                }
+            }
+        }
+    }
+
     let rel_path = path.trim_start_matches('/');
     let target = if rel_path.is_empty() {
         state.root.join("index.html")
@@ -198,8 +258,10 @@ async fn request_middleware(
             register_module(&source, &fname);
             match transform::transpile(&fname, &source) {
                 Ok((code, _map)) => {
+                    // Phase 11: Resolve path aliases before bare import rewriting
+                    let aliased = alias::resolve_aliases(&code, &fname, &state.aliases);
                     // Phase 2: Rewrite bare imports before serving to browser
-                    let rewritten = resolve::rewrite_bare_imports(&code, &fname, "/node_modules/.rush/deps");
+                    let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
                     // Phase 4: Inject import.meta.hot preamble
                     let mod_path = hmr::normalize_path(rel_path);
                     let mut with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
@@ -209,12 +271,20 @@ async fn request_middleware(
                         state.source_maps.write().unwrap().insert(map_path.clone(), map_json);
                         with_hmr.push_str(&format!("\n//# sourceMappingURL={map_path}\n"));
                     }
-                    return ([(header::CONTENT_TYPE, "application/javascript")], with_hmr)
+                    // Phase 9: Replace import.meta.env.* references
+                    let final_code = env::replace_env_vars(&with_hmr, &state.env_vars);
+                    return ([(header::CONTENT_TYPE, "application/javascript")], final_code)
                         .into_response();
                 }
                 Err(e) => {
-                    // ponytail: show error in browser console, not a custom overlay
-                    eprintln!("[rush] transpile error: {e}");
+                    // Phase 7: broadcast error for overlay + console fallback
+                    log::error(&format!("transpile error: {e}"));
+                    let error_msg = serde_json::json!({
+                        "type": "error",
+                        "file": rel_path,
+                        "message": e,
+                    });
+                    state.tx.send(error_msg.to_string()).ok();
                     let escaped = e.replace('\\', "\\\\").replace('`', "\\`");
                     return (
                         [(header::CONTENT_TYPE, "application/javascript")],
@@ -231,11 +301,15 @@ async fn request_middleware(
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
             register_module(&source, &fname);
-            let rewritten = resolve::rewrite_bare_imports(&source, &fname, "/node_modules/.rush/deps");
+            // Phase 11: Resolve path aliases before bare import rewriting
+            let aliased = alias::resolve_aliases(&source, &fname, &state.aliases);
+            let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
             // Phase 4: Inject import.meta.hot preamble
             let mod_path = hmr::normalize_path(rel_path);
             let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
-            return ([(header::CONTENT_TYPE, "application/javascript")], with_hmr)
+            // Phase 9: Replace import.meta.env.* references
+            let final_code = env::replace_env_vars(&with_hmr, &state.env_vars);
+            return ([(header::CONTENT_TYPE, "application/javascript")], final_code)
                 .into_response();
         }
     }
@@ -243,10 +317,12 @@ async fn request_middleware(
     next.run(req).await
 }
 
-fn parse_args() -> (u16, PathBuf) {
-    // ponytail: std::env::args covers this, clap is 50 crates for two flags
+fn parse_args() -> (u16, PathBuf, bool, Vec<(String, String)>) {
+    // ponytail: std::env::args covers this, clap is 50 crates for a few flags
     let mut port = 3000;
     let mut root = PathBuf::from(".");
+    let mut open = false;
+    let mut proxies = Vec::new();
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -259,15 +335,25 @@ fn parse_args() -> (u16, PathBuf) {
                 root = PathBuf::from(&args[i + 1]);
                 i += 1;
             }
+            "--open" | "-o" => {
+                open = true;
+            }
+            // Phase 10: --proxy /api=http://localhost:8080
+            "--proxy" if i + 1 < args.len() => {
+                if let Some((prefix, target)) = args[i + 1].split_once('=') {
+                    proxies.push((prefix.to_string(), target.to_string()));
+                }
+                i += 1;
+            }
             "--help" | "-h" => {
-                println!("Usage: rush [--port <port>] [--root <dir>]");
+                println!("Usage: rush [--port <port>] [--root <dir>] [--open] [--proxy <prefix>=<target>]");
                 std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
     }
-    (port, root)
+    (port, root, open, proxies)
 }
 
 fn should_ignore(path: &Path) -> bool {
@@ -280,18 +366,18 @@ fn should_ignore(path: &Path) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let (port, root) = parse_args();
+    let (port, root, open, proxies) = parse_args();
     let root = match root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("Error: Cannot resolve root directory {}: {}", root.display(), e);
+            log::error(&format!("cannot resolve root directory {}: {}", root.display(), e));
             std::process::exit(1);
         }
     };
 
     // Phase 3: Pre-bundle node_modules dependencies via esbuild
     if let Err(e) = resolve::prebundle(&root) {
-        eprintln!("[rush] prebundle notice: {e}");
+        log::warn(&format!("prebundle notice: {e}"));
     }
 
     let (tx, _rx) = broadcast::channel::<String>(16);
@@ -306,13 +392,13 @@ async fn main() {
         let mut debouncer = match new_debouncer(Duration::from_millis(50), sync_tx) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[rush] watcher error: {}", e);
+                log::error(&format!("watcher error: {}", e));
                 return;
             }
         };
 
         if let Err(e) = debouncer.watcher().watch(&watcher_root, RecursiveMode::Recursive) {
-            eprintln!("[rush] watcher register error: {}", e);
+            log::error(&format!("watcher register error: {}", e));
             return;
         }
 
@@ -336,7 +422,7 @@ async fn main() {
                         .as_millis();
 
                     if ext == "css" {
-                        println!("[rush] css update: {}", rel);
+                        log::event("css update:", &rel);
                         let msg = serde_json::json!({
                             "type": "css",
                             "path": hmr::normalize_path(&rel),
@@ -346,7 +432,7 @@ async fn main() {
                     } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
                         let boundaries = watcher_graph.read().unwrap().find_update_boundaries(&rel);
                         if let Some(targets) = boundaries {
-                            println!("[rush] hot update: {:?}", targets);
+                            log::event("hot update:", &format!("{:?}", targets));
                             for target in targets {
                                 let msg = serde_json::json!({
                                     "type": "js-update",
@@ -356,7 +442,7 @@ async fn main() {
                                 watcher_tx.send(msg.to_string()).ok();
                             }
                         } else {
-                            println!("[rush] reload: {}", rel);
+                            log::event("reload:", &rel);
                             let msg = serde_json::json!({
                                 "type": "full-reload",
                                 "path": hmr::normalize_path(&rel),
@@ -364,7 +450,7 @@ async fn main() {
                             watcher_tx.send(msg.to_string()).ok();
                         }
                     } else {
-                        println!("[rush] reload: {}", rel);
+                        log::event("reload:", &rel);
                         let msg = serde_json::json!({
                             "type": "full-reload",
                             "path": hmr::normalize_path(&rel),
@@ -378,11 +464,33 @@ async fn main() {
 
     let source_maps = Arc::new(RwLock::new(HashMap::new()));
 
+    // Phase 9: Load .env file
+    let env_vars = Arc::new(env::load_env(&root));
+    if env_vars.len() > 3 {
+        // 3 builtins (DEV, PROD, MODE) are always present; log only if user vars found
+        log::ok(&format!("loaded {} env vars from .env", env_vars.len() - 3));
+    }
+
+    // Phase 10: Proxy config
+    let proxies = Arc::new(proxies);
+    for (prefix, target) in proxies.iter() {
+        log::info(&format!("proxy: {} -> {}", prefix, target));
+    }
+
+    // Phase 11: Load path aliases from tsconfig.json
+    let aliases = Arc::new(alias::load_aliases(&root));
+    if !aliases.is_empty() {
+        log::ok(&format!("loaded {} path aliases from tsconfig.json", aliases.len()));
+    }
+
     let state = AppState {
         root: root.clone(),
         tx,
         graph,
         source_maps,
+        env_vars,
+        proxies,
+        aliases,
     };
 
     let app = Router::new()
@@ -396,17 +504,29 @@ async fn main() {
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("Error: Failed to bind to {}: {}", addr, e);
+            log::error(&format!("failed to bind to {}: {}", addr, e));
             std::process::exit(1);
         }
     };
 
+    let url = format!("http://localhost:{}/", port);
     println!();
-    println!("  🚀 Rush dev server running at:");
-    println!("  > Local:   http://localhost:{}/", port);
-    println!("  > Network: http://127.0.0.1:{}/", port);
-    println!("  > Root:    {}", root.display());
+    println!("  {}{}🚀 Rush dev server running at:{}", log::CYAN, log::BOLD, log::RESET);
+    println!("  {}>{} Local:   {}{}{}", log::GRAY, log::RESET, log::GREEN, url, log::RESET);
+    println!("  {}>{} Network: {}http://127.0.0.1:{}/{}", log::GRAY, log::RESET, log::GREEN, port, log::RESET);
+    println!("  {}>{} Root:    {}{}{}", log::GRAY, log::RESET, log::GRAY, root.display(), log::RESET);
     println!();
+
+    // Phase 6: Auto-open browser
+    // ponytail: platform-specific std::process::Command, no opener crate needed
+    if open {
+        #[cfg(target_os = "windows")]
+        { let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn(); }
+        #[cfg(target_os = "macos")]
+        { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+        #[cfg(target_os = "linux")]
+        { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+    }
 
     axum::serve(listener, app).await.unwrap();
 }

@@ -217,7 +217,7 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
             let out_name = pkg.replace('/', "__");
             entries.push((out_name, entry_file));
         } else {
-            eprintln!("[rush] warning: could not resolve entry for package '{pkg}'");
+            crate::log::warn(&format!("could not resolve entry for package '{pkg}'"));
         }
     }
 
@@ -265,7 +265,7 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
         let _ = std::fs::write(&cache_file, json);
     }
 
-    println!("[rush] pre-bundled {} dependencies into {}", cache.deps.len(), deps_dir.display());
+    crate::log::ok(&format!("pre-bundled {} dependencies into {}", cache.deps.len(), deps_dir.display()));
     Ok(Some(cache))
 }
 

@@ -1,4 +1,4 @@
-import { createCounter } from './counter.ts';
+import { createCounter } from '@/counter.ts';
 import confetti from 'canvas-confetti';
 
 const counter = createCounter(0);
@@ -9,4 +9,5 @@ btn.addEventListener('click', () => {
   btn.textContent = `Clicks: ${count}`;
 });
 
-console.log('[example] App loaded successfully.');
+console.log('[example] App loaded:', import.meta.env.RUSH_APP_NAME || 'Rush Demo');
+
