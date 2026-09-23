@@ -4,3 +4,4 @@ node_modules/
 *.orig
 .DS_Store
 Thumbs.db
+dist/

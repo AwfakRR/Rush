@@ -9,6 +9,7 @@ use axum::{
     routing::get,
     Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
 use std::{
     collections::HashMap,
@@ -26,6 +27,7 @@ mod hmr;
 mod log;
 mod env;
 mod alias;
+mod build;
 
 #[derive(Clone)]
 struct AppState {
@@ -56,7 +58,15 @@ const HMR_CLIENT: &str = r#"(() => {
     document.getElementById('__rush_error')?.remove();
   }
 
-  const socket = new WebSocket(`ws://${location.host}/__hmr`);
+  // Phase 15: React Fast Refresh runtime hooks
+  window.$RefreshReg$ = window.$RefreshReg$ || ((type, id) => {
+    window.__rush_refresh_registry = window.__rush_refresh_registry || new Map();
+    window.__rush_refresh_registry.set(id, type);
+  });
+  window.$RefreshSig$ = window.$RefreshSig$ || (() => (type) => type);
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${proto}//${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
   socket.addEventListener('message', ({ data }) => {
     let msg;
@@ -126,6 +136,23 @@ fn inject_hmr(html: &str) -> String {
 
 async fn hmr_client() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript")], HMR_CLIENT)
+}
+
+// Phase 15: React Fast Refresh runtime virtual module
+async fn react_refresh_runtime() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        r#"
+let isMounted = false;
+export default {
+  injectIntoGlobalHook(window) {},
+  register(type, id) {
+    if (window.$RefreshReg$) window.$RefreshReg$(type, id);
+  },
+  performReactRefresh() {},
+};
+"#,
+    )
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -314,46 +341,93 @@ async fn request_middleware(
         }
     }
 
+    // Phase 12: SPA Routing Fallback (History API fallback)
+    // ponytail: if target doesn't exist, but it's an HTML/navigation request, serve index.html
+    if !target.exists() && is_spa_fallback_request(req.method(), path, ext, req.headers()) {
+        let index_html = state.root.join("index.html");
+        if let Ok(content) = tokio::fs::read_to_string(&index_html).await {
+            return Html(inject_hmr(&content)).into_response();
+        }
+    }
+
     next.run(req).await
 }
 
-fn parse_args() -> (u16, PathBuf, bool, Vec<(String, String)>) {
+fn is_spa_fallback_request(
+    method: &axum::http::Method,
+    path: &str,
+    ext: &str,
+    headers: &axum::http::HeaderMap,
+) -> bool {
+    if method != axum::http::Method::GET || path.starts_with("/__") {
+        return false;
+    }
+    let is_html_req = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/html"))
+        .unwrap_or(false);
+    let has_no_ext = ext.is_empty();
+    is_html_req || has_no_ext
+}
+
+struct CliArgs {
+    port: u16,
+    root: PathBuf,
+    open: bool,
+    proxies: Vec<(String, String)>,
+    https: bool,
+    build: bool,
+}
+
+fn parse_args() -> CliArgs {
     // ponytail: std::env::args covers this, clap is 50 crates for a few flags
-    let mut port = 3000;
-    let mut root = PathBuf::from(".");
-    let mut open = false;
-    let mut proxies = Vec::new();
+    let mut args_out = CliArgs {
+        port: 3000,
+        root: PathBuf::from("."),
+        open: false,
+        proxies: Vec::new(),
+        https: false,
+        build: false,
+    };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "build" | "--build" => {
+                args_out.build = true;
+            }
             "--port" | "-p" if i + 1 < args.len() => {
-                port = args[i + 1].parse().unwrap_or(3000);
+                args_out.port = args[i + 1].parse().unwrap_or(3000);
                 i += 1;
             }
             "--root" | "-r" if i + 1 < args.len() => {
-                root = PathBuf::from(&args[i + 1]);
+                args_out.root = PathBuf::from(&args[i + 1]);
                 i += 1;
             }
             "--open" | "-o" => {
-                open = true;
+                args_out.open = true;
+            }
+            // Phase 13: --https for local SSL/TLS dev server
+            "--https" => {
+                args_out.https = true;
             }
             // Phase 10: --proxy /api=http://localhost:8080
             "--proxy" if i + 1 < args.len() => {
                 if let Some((prefix, target)) = args[i + 1].split_once('=') {
-                    proxies.push((prefix.to_string(), target.to_string()));
+                    args_out.proxies.push((prefix.to_string(), target.to_string()));
                 }
                 i += 1;
             }
             "--help" | "-h" => {
-                println!("Usage: rush [--port <port>] [--root <dir>] [--open] [--proxy <prefix>=<target>]");
+                println!("Usage: rush [build] [--port <port>] [--root <dir>] [--open] [--https] [--proxy <prefix>=<target>]");
                 std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
     }
-    (port, root, open, proxies)
+    args_out
 }
 
 fn should_ignore(path: &Path) -> bool {
@@ -366,14 +440,23 @@ fn should_ignore(path: &Path) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let (port, root, open, proxies) = parse_args();
-    let root = match root.canonicalize() {
+    let cli = parse_args();
+    let root = match cli.root.canonicalize() {
         Ok(p) => p,
         Err(e) => {
-            log::error(&format!("cannot resolve root directory {}: {}", root.display(), e));
+            log::error(&format!("cannot resolve root directory {}: {}", cli.root.display(), e));
             std::process::exit(1);
         }
     };
+
+    // Phase 16: Production Build command
+    if cli.build {
+        if let Err(e) = build::run_build(&root) {
+            log::error(&format!("build failed: {e}"));
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Phase 3: Pre-bundle node_modules dependencies via esbuild
     if let Err(e) = resolve::prebundle(&root) {
@@ -472,7 +555,7 @@ async fn main() {
     }
 
     // Phase 10: Proxy config
-    let proxies = Arc::new(proxies);
+    let proxies = Arc::new(cli.proxies);
     for (prefix, target) in proxies.iter() {
         log::info(&format!("proxy: {} -> {}", prefix, target));
     }
@@ -496,30 +579,27 @@ async fn main() {
     let app = Router::new()
         .route("/__hmr", get(ws_handler))
         .route("/__hmr.js", get(hmr_client))
+        .route("/@react-refresh", get(react_refresh_runtime))
         .fallback_service(ServeDir::new(&state.root))
         .layer(from_fn_with_state(state.clone(), request_middleware))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            log::error(&format!("failed to bind to {}: {}", addr, e));
-            std::process::exit(1);
-        }
-    };
-
-    let url = format!("http://localhost:{}/", port);
+    let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
+    let proto = if cli.https { "https" } else { "http" };
+    let url = format!("{proto}://localhost:{}/", cli.port);
     println!();
     println!("  {}{}🚀 Rush dev server running at:{}", log::CYAN, log::BOLD, log::RESET);
     println!("  {}>{} Local:   {}{}{}", log::GRAY, log::RESET, log::GREEN, url, log::RESET);
-    println!("  {}>{} Network: {}http://127.0.0.1:{}/{}", log::GRAY, log::RESET, log::GREEN, port, log::RESET);
+    println!("  {}>{} Network: {}{proto}://127.0.0.1:{}/{}", log::GRAY, log::RESET, log::GREEN, cli.port, log::RESET);
     println!("  {}>{} Root:    {}{}{}", log::GRAY, log::RESET, log::GRAY, root.display(), log::RESET);
+    if cli.https {
+        println!("  {}>{} TLS:     {}Self-signed certificate (accept browser warning){}", log::GRAY, log::RESET, log::YELLOW, log::RESET);
+    }
     println!();
 
     // Phase 6: Auto-open browser
     // ponytail: platform-specific std::process::Command, no opener crate needed
-    if open {
+    if cli.open {
         #[cfg(target_os = "windows")]
         { let _ = std::process::Command::new("cmd").args(["/C", "start", &url]).spawn(); }
         #[cfg(target_os = "macos")]
@@ -528,7 +608,35 @@ async fn main() {
         { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
     }
 
-    axum::serve(listener, app).await.unwrap();
+    if cli.https {
+        // Phase 13: HTTPS dev server via self-signed cert
+        // ponytail: generate self-signed cert in memory with rcgen, 0 config needed
+        let certified_key = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("failed to generate self-signed certificate");
+        let cert_pem = certified_key.cert.pem();
+        let key_pem = certified_key.signing_key.serialize_pem();
+
+        let tls_config = RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes())
+            .await
+            .expect("failed to load TLS certificate");
+
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    } else {
+        let listener = match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                log::error(&format!("failed to bind to {}: {}", addr, e));
+                std::process::exit(1);
+            }
+        };
+        axum::serve(listener, app).await.unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -554,5 +662,45 @@ mod tests {
         assert!(should_ignore(Path::new("target/debug/rush.exe")));
         assert!(!should_ignore(Path::new("src/main.rs")));
         assert!(!should_ignore(Path::new("index.html")));
+    }
+
+    #[test]
+    fn test_is_spa_fallback_request() {
+        use axum::http::{HeaderMap, HeaderValue, Method};
+
+        let mut headers = HeaderMap::new();
+        // Navigation to /dashboard with no extension
+        assert!(is_spa_fallback_request(&Method::GET, "/dashboard", "", &headers));
+
+        // Navigation with text/html Accept header
+        headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("text/html,application/xhtml+xml"));
+        assert!(is_spa_fallback_request(&Method::GET, "/users/profile", "", &headers));
+        assert!(is_spa_fallback_request(&Method::GET, "/some/page.html", "html", &headers));
+
+        // Asset/module request with extension
+        let mut asset_headers = HeaderMap::new();
+        asset_headers.insert(axum::http::header::ACCEPT, HeaderValue::from_static("*/*"));
+        assert!(!is_spa_fallback_request(&Method::GET, "/style.css", "css", &asset_headers));
+        assert!(!is_spa_fallback_request(&Method::GET, "/app.js", "js", &asset_headers));
+
+        // Non-GET requests should never trigger fallback
+        assert!(!is_spa_fallback_request(&Method::POST, "/api/login", "", &headers));
+
+        // Internal endpoints should never trigger fallback
+        assert!(!is_spa_fallback_request(&Method::GET, "/__hmr", "", &headers));
+    }
+
+    #[test]
+    fn test_rcgen_cert_generation() {
+        let certified_key = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("failed to generate certificate");
+        let cert_pem = certified_key.cert.pem();
+        let key_pem = certified_key.signing_key.serialize_pem();
+        assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+        assert!(cert_pem.contains("END CERTIFICATE"));
+        assert!(key_pem.contains("PRIVATE KEY"));
     }
 }

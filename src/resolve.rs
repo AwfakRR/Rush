@@ -213,7 +213,15 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
     // 3. Resolve entry points in node_modules
     let mut entries = Vec::new();
     for pkg in &bare_set {
-        if let Some(entry_file) = resolve_package_entry(root, pkg) {
+        let mut entry_opt = resolve_package_entry(root, pkg);
+        if entry_opt.is_none() && root.join("package.json").exists() {
+            // Phase 14: Auto-install missing dependency if package.json exists in root
+            if let Ok(()) = auto_install_package(root, pkg) {
+                entry_opt = resolve_package_entry(root, pkg);
+            }
+        }
+
+        if let Some(entry_file) = entry_opt {
             let out_name = pkg.replace('/', "__");
             entries.push((out_name, entry_file));
         } else {
@@ -269,6 +277,58 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
     Ok(Some(cache))
 }
 
+/// Detect the active package manager by checking for lockfiles in the root.
+pub fn detect_package_manager(root: &Path) -> &'static str {
+    if root.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if root.join("yarn.lock").exists() {
+        "yarn"
+    } else if root.join("bun.lockb").exists() || root.join("bun.lock").exists() {
+        "bun"
+    } else {
+        "npm"
+    }
+}
+
+/// Auto-install a missing dependency package.
+/// ponytail: invoke package manager via std::process::Command. No custom npm client.
+pub fn auto_install_package(root: &Path, pkg: &str) -> Result<(), String> {
+    let pm = detect_package_manager(root);
+    crate::log::info(&format!("auto-installing missing dependency '{pkg}' via {pm}..."));
+
+    let (cmd_name, args) = match pm {
+        "pnpm" => {
+            let cmd = if cfg!(windows) { "pnpm.cmd" } else { "pnpm" };
+            (cmd, vec!["add", pkg])
+        }
+        "yarn" => {
+            let cmd = if cfg!(windows) { "yarn.cmd" } else { "yarn" };
+            (cmd, vec!["add", pkg])
+        }
+        "bun" => {
+            let cmd = if cfg!(windows) { "bun.exe" } else { "bun" };
+            (cmd, vec!["add", pkg])
+        }
+        _ => {
+            let cmd = if cfg!(windows) { "npm.cmd" } else { "npm" };
+            (cmd, vec!["install", pkg])
+        }
+    };
+
+    let status = std::process::Command::new(cmd_name)
+        .args(&args)
+        .current_dir(root)
+        .status()
+        .map_err(|e| format!("failed to execute {cmd_name}: {e}"))?;
+
+    if status.success() {
+        crate::log::ok(&format!("installed '{pkg}' successfully"));
+        Ok(())
+    } else {
+        Err(format!("{cmd_name} exited with status: {status}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +379,11 @@ export * from 'lodash-es';"#;
         let mut bare = HashSet::new();
         scan_dir_for_bare_imports(Path::new("example"), Path::new("example"), &mut bare);
         assert!(bare.contains("canvas-confetti"));
+    }
+
+    #[test]
+    fn test_detect_package_manager() {
+        // In this project root, there is Cargo.lock, not yarn or pnpm, so defaults to npm
+        assert_eq!(detect_package_manager(Path::new(".")), "npm");
     }
 }

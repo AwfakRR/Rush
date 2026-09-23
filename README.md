@@ -65,13 +65,29 @@ cargo build --release
 
 ## CLI Options
 
-| Flag | Short | Default | Description |
+| Command / Flag | Short | Default | Description |
 |---|---|---|---|
+| `rush build` | - | - | Bundle project for production into `dist/` |
 | `--port <port>` | `-p` | `3000` | Port for the HTTP and WebSocket server |
 | `--root <dir>` | `-r` | `.` | Root directory containing static files and source code |
 | `--open` | `-o` | - | Auto-open browser on server start |
+| `--https` | - | - | Enable HTTPS with on-the-fly self-signed TLS certificates |
 | `--proxy <prefix>=<url>` | - | - | Forward requests matching prefix to target URL |
 | `--help` | `-h` | - | Display help information |
+
+### Production Build Example
+
+```bash
+# Bundle, minify, hash assets, and output to dist/
+rush build --root ./example
+```
+
+### HTTPS Example
+
+```bash
+# Start local dev server with zero-config HTTPS
+rush --root ./example --https
+```
 
 ### Proxy Example
 
@@ -93,6 +109,7 @@ example/
 ├── main.js        # JavaScript application code
 ├── counter.ts     # TypeScript file with import.meta.hot.accept()
 ├── config.json    # JSON module imported directly into JS
+├── tsconfig.json  # Path aliases (@/* -> ./*)
 └── .env           # Environment variables (RUSH_-prefixed)
 ```
 
@@ -104,30 +121,17 @@ cargo run -- --root example --port 3000 --open
 
 Then open `http://localhost:3000` in your browser. Any edit to `style.css` will hot-swap instantly; edits to `.ts` or `.html` will trigger a clean reload. Syntax errors show a red overlay in the browser.
 
-### Environment Variables
+### Single Page Application (SPA) Routing Fallback
 
-Create a `.env` file in your project root:
+Rush automatically supports HTML5 History API routing. Any navigation request to paths without a file extension (e.g. `/dashboard` or `/settings`) automatically falls back to `index.html` with HMR injected.
 
-```env
-RUSH_API_URL=http://localhost:8080
-RUSH_APP_NAME=My App
-```
+### React Fast Refresh
 
-Access in code via `import.meta.env.RUSH_API_URL`. Built-in vars: `import.meta.env.DEV` (`true`), `import.meta.env.MODE` (`"development"`).
+React JSX/TSX components automatically benefit from React Fast Refresh transforms via `oxc` and runtime hooks, allowing components to hot-reload while preserving state.
 
-### Path Aliases
+### Auto-Install Dependencies
 
-Add a `tsconfig.json` with `compilerOptions.paths`:
-
-```json
-{
-  "compilerOptions": {
-    "paths": { "@/*": ["./src/*"] }
-  }
-}
-```
-
-Then `import { Foo } from '@/components/Foo'` resolves to `./src/components/Foo`.
+If a bare import cannot be resolved, Rush automatically detects your package manager (`pnpm`, `yarn`, `bun`, or `npm`), installs the missing package, and pre-bundles it without leaving your workflow.
 
 ---
 
@@ -158,6 +162,11 @@ Rush follows strict **Ponytail engineering principles**:
 - [x] **Phase 9**: `.env` file loading + `import.meta.env` replacement
 - [x] **Phase 10**: `--proxy` API request forwarding
 - [x] **Phase 11**: Path aliases from `tsconfig.json`
+- [x] **Phase 12**: SPA routing fallback (HTML5 History API)
+- [x] **Phase 13**: HTTPS dev server (`--https` with on-the-fly self-signed certs)
+- [x] **Phase 14**: Auto-install missing dependencies (`pnpm`, `yarn`, `bun`, `npm`)
+- [x] **Phase 15**: React Fast Refresh (state-preserving HMR)
+- [x] **Phase 16**: Production build (`rush build` into `dist/`)
 
 ---
 

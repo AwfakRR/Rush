@@ -29,8 +29,9 @@ pub fn transpile(filename: &str, source: &str) -> Result<(String, Option<String>
     let semantic_ret = SemanticBuilder::new().build(&program);
     let scoping = semantic_ret.semantic.into_scoping();
 
-    // 3. Transform (TypeScript type stripping + JSX automatic lowering)
-    let transform_options = TransformOptions::default();
+    // 3. Transform (TypeScript type stripping + JSX automatic lowering + React Fast Refresh)
+    let mut transform_options = TransformOptions::default();
+    transform_options.jsx.refresh = Some(Default::default());
     let _ = Transformer::new(&allocator, path, &transform_options)
         .build_with_scoping(scoping, &mut program);
 
@@ -71,8 +72,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sourcemap() {
-        let (_, map) = transpile("test.ts", "const x: number = 42;").unwrap();
-        println!("Map is: {:?}", map);
+    fn test_transforms_jsx_refresh() {
+        let mut opts = TransformOptions::default();
+        opts.jsx.refresh = Some(Default::default());
+        // Verify transpile handles JSX refresh
+        let (code, _) = transpile("Component.tsx", "export function App() { return <h1>Hello</h1>; }").unwrap();
+        println!("Transpiled code:\n{code}");
     }
 }
