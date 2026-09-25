@@ -5,8 +5,8 @@
 <h1 align="center">Rush</h1>
 
 <p align="center">
-  <b>A blazingly fast, minimalist dev server written in Rust.</b><br/>
-  Built with the <i>Ponytail philosophy</i> (the simplest, shortest, most efficient solution that works).
+  <b>A blazingly fast, minimalist dev server and build tool written in Rust.</b><br/>
+  Engineered from first principles: the simplest, shortest, and most efficient solution that works.
 </p>
 
 <p align="center">
@@ -14,26 +14,29 @@
   <a href="#quick-start">Quick Start</a> •
   <a href="#cli-options">CLI Options</a> •
   <a href="#example-project">Example</a> •
-  <a href="#architecture--ponytail-engineering">Architecture</a> •
+  <a href="#architecture--design-philosophy">Architecture & Philosophy</a> •
   <a href="#roadmap">Roadmap</a> •
   <a href="#license">License</a>
 </p>
 
 ---
 
-Rush provides instant local web development with on-the-fly TypeScript/JSX transpilation, debounced file watching, WebSocket-based live reload, and CSS hot swapping — all without the overhead of heavy JavaScript runtimes or multi-megabyte dependency trees.
+Rush provides instant local web development with on-the-fly TypeScript/JSX transpilation, debounced file watching, WebSocket-based live reload, CSS hot swapping, and a production bundler — all without the overhead of heavy JavaScript runtimes or multi-megabyte dependency trees.
 
 ## Features
 
 - **⚡ Sub-millisecond Transpilation**: Instant on-the-fly TypeScript (`.ts`), TSX (`.tsx`), and JSX (`.jsx`) transpilation powered by [`oxc`](https://github.com/oxc-project/oxc) — the high-performance Rust toolchain behind Rolldown.
 - **🔄 Live Reload & CSS Hot Swap**: WebSocket connection automatically reloads the browser on file saves. Changes to `.css` files hot-swap stylesheets instantly without losing page state or triggering a full refresh.
-- **🔥 Granular Module HMR**: Supports `import.meta.hot.accept()` and dependency graph boundary resolution to update individual JS/TS modules in-place.
+- **🔥 Granular Module HMR & React Fast Refresh**: Supports `import.meta.hot.accept()` and dependency graph boundary resolution to update individual JS/TS modules in-place, plus state-preserving React component refresh.
 - **📦 Bare Import Resolution & Pre-bundling**: Rewrites bare npm specifiers (`import React from 'react'`) and automatically pre-bundles CommonJS/ESM dependencies with `esbuild`.
+- **🛠️ Self-Healing Auto-Install**: Automatically detects your package manager (`pnpm`, `yarn`, `bun`, or `npm`) and installs missing dependencies on the fly.
+- **🌐 HTML5 History API Routing**: Built-in SPA fallback routing so React Router, Vue Router, and SvelteKit routes work seamlessly without 404s.
+- **🔒 Zero-Config HTTPS**: On-demand self-signed TLS certificate generation in memory via `rcgen` and `axum-server`.
 - **🗺️ Standard v3 Source Maps**: Generates and serves in-memory source maps (`.map`) for seamless in-browser debugging of original TypeScript source.
-- **📄 JSON & Static Asset Modules**: Import JSON files directly as default objects, and static media files (`.png`, `.svg`, etc.) as URL strings.
+- **📄 JSON, Environment & Asset Modules**: Built-in `.env` parsing with `RUSH_` filtering, JSON module imports, and static media URL exports.
+- **🏗️ Fast Production Builds**: Single-command `rush build` leveraging `esbuild` to bundle, minify, and hash assets into a self-contained `dist/` folder in hundreds of milliseconds.
 - **🛡️ Debounced File Watching**: 50ms debouncer coalesces IDE and editor atomic saves into single clean reload triggers.
-- **💉 Zero-Config HTML Injection**: Automatically injects the lightweight client runtime into `<head>` before serving HTML documents.
-- **✂️ Minimal Dependency Footprint**: Built with just 5 core Rust crates, prioritizing standard library APIs and native platform features over dependency bloat.
+- **✂️ Minimal Dependency Footprint**: Prioritizes standard library APIs and native platform capabilities over dependency bloat.
 
 ---
 
@@ -50,8 +53,8 @@ Clone the repository and run:
 # Serve the current directory on default port 3000
 cargo run
 
-# Serve a specific folder on a custom port
-cargo run -- --root ./example --port 5173
+# Serve a specific folder on a custom port and auto-open browser
+cargo run -- --root ./example --port 5173 --open
 ```
 
 Build an optimized release binary:
@@ -135,17 +138,17 @@ If a bare import cannot be resolved, Rush automatically detects your package man
 
 ---
 
-## Architecture & Ponytail Engineering
+## Architecture & Design Philosophy
 
-Rush follows strict **Ponytail engineering principles**:
+Rush is built on **radical pragmatism and first-principles simplicity**: delivering a complete, modern developer experience by cutting away accidental complexity, avoiding dependency bloat, and embracing native platform features.
 
-1. **Native Platform Capabilities First**: Modern browsers natively support ES modules (`<script type="module">`). Dev mode serves native ESM instead of doing unnecessary full-project bundling on every keystroke.
-2. **Standard Library Over Dependencies**: CLI parsing uses `std::env::args`, HTML script injection uses standard `String::find`, cache hashing uses `DefaultHasher`, colored output uses raw ANSI codes, and `.env` parsing is hand-rolled string splitting.
-3. **Sub-crate Lockstep**: Uses unified `oxc` features (`transformer`, `semantic`, `codegen`) to guarantee compatibility across AST, parser, and code generation steps.
-4. **Deliberate Simplifications**: Every shortcut is documented with clear boundaries:
-   - Ignored noise directories (`node_modules`, `.git`, `target`) without heavy gitignore parser overhead.
-   - Transpile errors shown as a browser overlay with WebSocket push.
-   - Sub-millisecond AST transformations eliminate the need for complex in-memory file caching.
+1. **Native Platform Capabilities First**: Modern browsers natively support ES modules (`<script type="module">`). Dev mode serves native ESM directly over HTTP instead of burning cycles re-bundling the entire project on every keystroke. Terminal styling uses direct ANSI escape sequences rather than adding terminal-color crates.
+2. **Standard Library Over Dependency Creep**: When a task can be achieved cleanly with Rust's standard library, we resist pulling in extra crates. CLI argument parsing uses `std::env::args`, script injection uses straightforward string operations, cache verification uses `DefaultHasher`, and `.env` parsing is a concise string parser that enforces secure `RUSH_` scoping.
+3. **Deep Tooling Synergy**: Rather than stitching together fragmented or conflicting compilers, Rush uses unified `oxc` capabilities (`transformer`, `semantic`, `codegen`) to handle parsing, TypeScript type stripping, JSX lowering, and React Fast Refresh in a single microsecond-level pass.
+4. **Deliberate Pragmatism (YAGNI)**: We avoid speculative abstractions and heavyweight machinery in favor of direct, observable solutions:
+   - High-performance directory filtering (`node_modules`, `.git`, `target`) without the overhead of heavy `.gitignore` parsers.
+   - Immediate error overlay pushed via lightweight WebSockets rather than dragging in bloated error-runtime dependencies.
+   - Microsecond on-the-fly AST transformations eliminate the need for complicated, invalidation-prone in-memory file caching layers.
 
 ---
 
