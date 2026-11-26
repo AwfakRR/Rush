@@ -9,17 +9,27 @@ use serde_json::Value;
 use std::{path::Path, process::Command, time::Duration};
 use tokio_tungstenite::connect_async;
 
-fn project() -> Option<Fixture> {
+#[derive(Clone, Copy)]
+enum Tailwind {
+    V3,
+    V4,
+}
+
+fn project(version: Tailwind) -> Option<Fixture> {
     let modules = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/node_modules");
+    let tailwind = match version {
+        Tailwind::V3 => ["tailwindcss-v3"].as_slice(),
+        Tailwind::V4 => ["tailwindcss", "@tailwindcss/postcss"].as_slice(),
+    };
     if Command::new("node").arg("--version").output().is_err()
         || ![
             "esbuild",
             "postcss",
             "postcss-load-config",
             "postcss-modules",
-            "tailwindcss",
         ]
         .iter()
+        .chain(tailwind)
         .all(|name| modules.join(name).join("package.json").is_file())
     {
         eprintln!("skipping: Node.js and example dependencies needed (npm ci --prefix example)");
@@ -29,16 +39,33 @@ fn project() -> Option<Fixture> {
     std::os::unix::fs::symlink(modules, fixture.path().join("node_modules")).unwrap();
     fixture
         .write("package.json", r#"{"type":"module"}"#)
-        .write(".postcssrc.mjs", "export default { plugins: { tailwindcss: { content: ['./main.js'] } } };")
         .write(
             "index.html",
             r#"<html><head><link rel="stylesheet" href="/style.css"></head><body><script type="module" src="/main.js"></script></body></html>"#,
         )
-        .write("style.css", "@tailwind utilities;")
         .write("side-effect.css", ".global { display: grid; }")
         .write("first.module.css", ".button { color: red; }")
         .write("second.module.css", ".button { color: blue; }")
         .write("main.js", ENTRY);
+    match version {
+        Tailwind::V3 => fixture
+            .write(
+                ".postcssrc.mjs",
+                "export default { plugins: { 'tailwindcss-v3': { content: ['./main.js'] } } };",
+            )
+            .write("style.css", "@tailwind utilities;"),
+        Tailwind::V4 => fixture
+            .write(
+                "postcss.config.cjs",
+                "module.exports = { plugins: { '@tailwindcss/postcss': {} } };",
+            )
+            .write(
+                "style.css",
+                "@import \"tailwindcss\";\n@source \"./templates\";",
+            )
+            .write(".gitignore", "/templates\n/dist\n")
+            .write("templates/email.html", "<p class=\"italic\">Message</p>"),
+    };
     Some(fixture)
 }
 
@@ -54,9 +81,23 @@ async fn classes(server: &Server, path: &str) -> Value {
 
 #[tokio::test]
 async fn dev_modules_are_scoped_and_tailwind_cache_tracks_content() {
-    let Some(fixture) = project() else { return };
+    check_dev(Tailwind::V3).await;
+}
+
+#[tokio::test]
+async fn tailwind_v4_dev_scans_content_and_hot_swaps_css() {
+    check_dev(Tailwind::V4).await;
+}
+
+async fn check_dev(version: Tailwind) {
+    let Some(fixture) = project(version) else {
+        return;
+    };
     let server = Server::start(fixture.path(), &[]);
     assert!(server.get_text("/style.css").await.contains(".font-bold"));
+    if matches!(version, Tailwind::V4) {
+        assert!(server.get_text("/style.css").await.contains(".italic"));
+    }
     assert!(server
         .get_text("/side-effect.css?import")
         .await
@@ -105,6 +146,13 @@ async fn dev_modules_are_scoped_and_tailwind_cache_tracks_content() {
     let css = server.get_text("/style.css").await;
     assert!(css.contains(".font-black"));
     assert!(!css.contains(".font-bold"));
+    if matches!(version, Tailwind::V4) {
+        fixture.write("templates/email.html", "<p class=\"underline\">Message</p>");
+        assert_eq!(next_message(&mut ws).await["type"], "css");
+        let css = server.get_text("/style.css").await;
+        assert!(css.contains(".underline"));
+        assert!(!css.contains(".italic"));
+    }
 }
 
 async fn next_message(
@@ -122,7 +170,18 @@ async fn next_message(
 
 #[tokio::test]
 async fn build_links_bundled_css_with_the_same_scoped_names_as_dev() {
-    let Some(fixture) = project() else { return };
+    check_build(Tailwind::V3).await;
+}
+
+#[tokio::test]
+async fn tailwind_v4_build_emits_utilities_and_scoped_module_css() {
+    check_build(Tailwind::V4).await;
+}
+
+async fn check_build(version: Tailwind) {
+    let Some(fixture) = project(version) else {
+        return;
+    };
     let scoped = {
         let server = Server::start(fixture.path(), &[]);
         classes(&server, "/first.module.css").await["button"]
@@ -159,4 +218,9 @@ async fn build_links_bundled_css_with_the_same_scoped_names_as_dev() {
     let linked = std::fs::read_to_string(dist.join("style.css")).unwrap();
     assert!(linked.contains(".font-bold"), "{linked}");
     assert!(!linked.contains("@tailwind"), "{linked}");
+    if matches!(version, Tailwind::V4) {
+        assert!(linked.contains(".italic"), "{linked}");
+        assert!(!linked.contains("@import"), "{linked}");
+        assert!(!linked.contains("@source"), "{linked}");
+    }
 }

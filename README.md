@@ -121,7 +121,7 @@ npm install -D esbuild postcss postcss-modules
 
 For a PostCSS project, install `postcss` and `postcss-load-config` alongside the project's plugins. Rush loads the root PostCSS config in both dev and `rush build` (`postcss.config.js`, `.cjs`, `.mjs`, `.postcssrc` and its supported extensions, or the `postcss` field in `package.json`). YAML and TypeScript config formats may require the optional loader dependencies documented by [postcss-load-config](https://github.com/postcss/postcss-load-config). Production builds with PostCSS or CSS Module imports use the project's installed `esbuild` package.
 
-Use Tailwind through that config like any PostCSS plugin. The example uses Tailwind v3 with explicit content globs and `@tailwind utilities`; Tailwind v4 uses its `@tailwindcss/postcss` plugin and `@import "tailwindcss"` instead. Rush reruns PostCSS after project file edits so Tailwind can pick up utility classes from changed content.
+The example uses Tailwind v4. Install `tailwindcss` and `@tailwindcss/postcss`, add `'@tailwindcss/postcss': {}` to the PostCSS config's `plugins` object, and put `@import "tailwindcss";` in the global stylesheet. Automatic content detection works from the project root; add an `@source` directive to include files Tailwind would otherwise skip. In dev, Rush invalidates the PostCSS cache on project edits so Tailwind picks up added or removed classes. Tailwind v3 still works with its `tailwindcss` PostCSS plugin, explicit content globs, and `@tailwind` directives.
 
 Stylesheet edits hot-swap the CSS without losing page state. If a CSS Module's exported classes change, Rush reloads the page so importers receive the new map.
 
