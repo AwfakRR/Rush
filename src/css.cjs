@@ -7,13 +7,13 @@ const root = process.cwd();
 const projectRequire = createRequire(path.join(root, 'package.json'));
 console.log = console.info = console.debug = console.error;
 
-function dependency(name) {
+function dependency(name, purpose = 'CSS processing') {
   let file;
   try {
     file = projectRequire.resolve(name);
   } catch (error) {
     if (error.code !== 'MODULE_NOT_FOUND') throw error;
-    throw new Error(`CSS processing requires ${name}. Run npm install -D ${name} in ${root}.`);
+    throw new Error(`${purpose} requires ${name}. Run npm install -D ${name.split('/').slice(0, name.startsWith('@') ? 2 : 1).join('/')} in ${root}.`);
   }
   return projectRequire(file);
 }
@@ -84,7 +84,7 @@ async function build(entries, outdir, configured) {
     chunkNames: '[name]-[hash]',
     assetNames: '[name]-[hash]',
     metafile: true,
-    plugins: [{
+    plugins: [frameworkPlugin(), {
       name: 'rush-css',
       setup(build) {
         build.onResolve({ filter: /^rush-css:/, namespace: 'rush-css-module' }, (args) => ({
@@ -126,9 +126,24 @@ async function build(entries, outdir, configured) {
 
 async function main() {
   const [action, configured, file, ...entries] = process.argv.slice(1);
-  const output = action === 'build'
-    ? await build(entries, file, configured === 'true')
-    : await (await processor(configured === 'true'))(file);
+  let output;
+  switch (action) {
+    case 'build': output = await build(entries, file, configured === 'true'); break;
+    case 'component': output = await devComponent(file); break;
+    case 'scan-components': {
+      output = [];
+      for (const entry of [file, ...entries]) {
+        try {
+          output.push(await compileFramework(entry, false));
+        } catch (error) {
+          console.error(`${entry}: ${error.message}`);
+        }
+      }
+      break;
+    }
+    case 'framework-deps': output = await frameworkDeps(entries, file); break;
+    default: output = await (await processor(configured === 'true'))(file);
+  }
   process.stdout.write(JSON.stringify(output));
 }
 

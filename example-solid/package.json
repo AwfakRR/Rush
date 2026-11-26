@@ -1,0 +1,6 @@
+{
+  "name": "rush-example-solid",
+  "private": true,
+  "dependencies": { "solid-js": "^1.9.0" },
+  "devDependencies": { "@babel/core": "^7.28.0", "babel-preset-solid": "^1.9.0", "solid-refresh": "^0.7.0", "esbuild": "^0.28.2" }
+}

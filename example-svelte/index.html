@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rush + Svelte</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { min-height: 100vh; display: grid; place-items: center; margin: 0; padding: 1.5rem; background: #ffedd5; color: #172033; font: 1rem/1.6 system-ui, sans-serif; }
+    main { width: min(100%, 32rem); padding: clamp(1.5rem, 6vw, 3rem); background: white; border-radius: 1.5rem; box-shadow: 0 18px 60px #1720331c; }
+    .label { color: #c2410c; font-size: .75rem; font-weight: 800; text-transform: uppercase; letter-spacing: .15em; }
+    h1 { font-size: clamp(2rem, 8vw, 3.1rem); letter-spacing: -.05em; line-height: 1.1; margin: .75rem 0; }
+    p { color: #475569; margin: 0 0 1.5rem; }
+    button { border: 0; border-radius: .75rem; padding: .7rem 1.25rem; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+    footer { margin-top: 2rem; border-top: 1px solid #e2e8f0; padding-top: 1rem; color: #475569; font-size: .875rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <span class="label">Svelte 5 • Compiled component</span>
+    <div id="app"></div>
+    <footer>Powered by Rush</footer>
+  </main>
+  <script type="module" src="/main.js"></script>
+</body>
+</html>

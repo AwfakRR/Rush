@@ -82,8 +82,14 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
     production: bool,
     paths: &[&Path],
 ) -> Result<T, String> {
+    let purpose = match action {
+        "build" => "building the project",
+        "style" => "CSS processing",
+        _ => "framework compilation",
+    };
     let output = Command::new("node")
         .current_dir(root)
+        .env("RUSH_SOLID", crate::framework::solid(root).to_string())
         .env(
             "NODE_ENV",
             if production {
@@ -94,14 +100,14 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
         )
         .args([
             "-e",
-            include_str!("css.cjs"),
+            concat!(include_str!("framework.cjs"), "\n", include_str!("css.cjs")),
             "--",
             action,
             if configured { "true" } else { "false" },
         ])
         .args(paths)
         .output()
-        .map_err(|error| format!("could not run Node.js for CSS processing: {error}"))?;
+        .map_err(|error| format!("could not run Node.js for {purpose}: {error}"))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         return Err(stderr.trim().to_string());
@@ -110,7 +116,7 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
         crate::log::warn(stderr.trim());
     }
     serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("invalid Node.js CSS output: {error}"))
+        .map_err(|error| format!("invalid Node.js output for {purpose}: {error}"))
 }
 
 #[derive(Default)]
