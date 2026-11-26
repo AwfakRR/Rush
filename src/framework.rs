@@ -36,6 +36,7 @@ pub fn compile(root: &Path, source: &Path) -> Result<Component, String> {
 }
 
 fn collect_sources(
+    root: &Path,
     dir: &Path,
     solid: bool,
     plain: &mut Vec<PathBuf>,
@@ -55,9 +56,12 @@ fn collect_sources(
             if !name.starts_with('.')
                 && !matches!(name.as_ref(), "node_modules" | "dist" | "target")
             {
-                collect_sources(&path, solid, plain, components);
+                collect_sources(root, &path, solid, plain, components);
             }
         } else if let Some(ext) = path.extension().and_then(|ext| ext.to_str()) {
+            if dir == root && crate::plugins::is_config(&path) {
+                continue;
+            }
             if handles(ext, solid) {
                 components.push(path);
             } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
@@ -70,7 +74,7 @@ fn collect_sources(
 pub fn prebundle(root: &Path, solid: bool) -> Result<(), String> {
     let mut plain = Vec::new();
     let mut components = Vec::new();
-    collect_sources(root, solid, &mut plain, &mut components);
+    collect_sources(root, root, solid, &mut plain, &mut components);
     if components.is_empty() && !solid {
         return crate::resolve::prebundle(root).map(|_| ());
     }

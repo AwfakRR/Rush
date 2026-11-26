@@ -83,7 +83,7 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
     paths: &[&Path],
 ) -> Result<T, String> {
     let purpose = match action {
-        "build" => "building the project",
+        "build" | "plugin-build" => "building the project",
         "style" => "CSS processing",
         _ => "framework compilation",
     };
@@ -100,7 +100,11 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
         )
         .args([
             "-e",
-            concat!(include_str!("framework.cjs"), "\n", include_str!("css.cjs")),
+            concat!(
+                include_str!("vite_plugins.cjs"), "\n",
+                include_str!("framework.cjs"), "\n",
+                include_str!("css.cjs"),
+            ),
             "--",
             action,
             if configured { "true" } else { "false" },
