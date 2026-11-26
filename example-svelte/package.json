@@ -1,0 +1,6 @@
+{
+  "name": "rush-example-svelte",
+  "private": true,
+  "dependencies": { "svelte": "^5.0.0" },
+  "devDependencies": { "esbuild": "^0.28.2" }
+}

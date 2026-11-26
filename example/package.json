@@ -10,13 +10,20 @@
   "license": "ISC",
   "description": "",
   "devDependencies": {
+    "@babel/core": "^7.28.0",
     "@tailwindcss/postcss": "^4.3.5",
+    "@vue/compiler-sfc": "^3.5.0",
+    "babel-preset-solid": "^1.9.0",
     "esbuild": "^0.28.2",
     "postcss": "^8.5.33",
     "postcss-load-config": "^6.0.1",
     "postcss-modules": "^6.0.1",
+    "solid-js": "^1.9.0",
+    "solid-refresh": "^0.7.0",
+    "svelte": "^5.0.0",
     "tailwindcss": "^4.3.5",
-    "tailwindcss-v3": "npm:tailwindcss@^3.4.19"
+    "tailwindcss-v3": "npm:tailwindcss@^3.4.19",
+    "vue": "^3.5.0"
   },
   "dependencies": {
     "canvas-confetti": "^1.9.4"

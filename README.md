@@ -30,6 +30,7 @@ Rush provides instant local web development with on-the-fly TypeScript/JSX trans
 - **⚡ Sub-millisecond Transpilation**: Instant on-the-fly TypeScript (`.ts`), TSX (`.tsx`), and JSX (`.jsx`) transpilation powered by [`oxc`](https://github.com/oxc-project/oxc) — the high-performance Rust toolchain behind Rolldown.
 - **🔄 Live Reload & CSS Hot Swap**: WebSocket connection automatically reloads the browser on file saves. Changes to `.css` files hot-swap stylesheets instantly without losing page state or triggering a full refresh.
 - **🔥 Granular Module HMR & React Fast Refresh**: Supports `import.meta.hot.accept()` and dependency graph boundary resolution to update individual JS/TS modules in-place, plus state-preserving React component refresh.
+- **🧩 Vue, Svelte & Solid**: Compile Vue 3 single-file components, Svelte 5 components, and Solid JSX in both the dev server and production builds.
 - **📦 Bare Import Resolution & Pre-bundling**: Rewrites bare npm specifiers (`import React from 'react'`) and automatically pre-bundles CommonJS/ESM dependencies with `esbuild`.
 - **🛠️ Self-Healing Auto-Install**: Automatically detects your package manager (`pnpm`, `yarn`, `bun`, or `npm`) and installs missing dependencies on the fly.
 - **🌐 HTML5 History API Routing**: Built-in SPA fallback routing so React Router, Vue Router, and SvelteKit routes work seamlessly without 404s.
@@ -102,6 +103,35 @@ by multiple entries can be shared between pages. The build report lists the raw 
 gzip-compressed size of each output file in KiB; it does not write `.gz` files.
 In the example, click **Load lazy chunk** to see the filename loaded by the browser, or
 follow **About this build** to open the second page and its own JavaScript entry.
+
+### Vue, Svelte and Solid
+
+Framework projects use Node.js and the compiler packages installed in the project's
+`node_modules`. Install `esbuild` in each project, plus the packages below:
+
+| Framework | Runtime dependencies | Development dependencies (besides `esbuild`) | Source files |
+| --- | --- | --- | --- |
+| Vue 3 | `vue` | `@vue/compiler-sfc` (match your Vue version) | `.vue` with templates, scripts or script setup (including TypeScript), and plain or scoped styles |
+| Svelte 5 | `svelte` | — | `.svelte` with plain styles and types-only TypeScript |
+| Solid | `solid-js` | `@babel/core`, `babel-preset-solid`, `solid-refresh` | `.jsx` and `.tsx` in a project declaring `solid-js` in `package.json` |
+
+Import components with their file extensions. The dev server applies Vue template edits
+without resetting local state; changes to a component's logic can remount it. Svelte's
+compiler HMR and Solid Refresh replace edited components without reloading the page, but
+local state can reset when the component remounts. Changes to SFC styles are applied
+without a page reload. Restart the dev server after adding a new bare dependency import
+so Rush can pre-bundle it.
+
+Try any of the three counters by replacing `vue` below with `svelte` or `solid`:
+
+```bash
+npm install --prefix example-vue
+rush --root ./example-vue --port 5173
+# Edit Counter.vue with the dev page open at http://localhost:5173.
+
+rush build --root ./example-vue
+python3 -m http.server 8080 --directory ./example-vue/dist
+```
 
 ### Library Mode
 
@@ -227,7 +257,7 @@ Rush is built on **radical pragmatism and first-principles simplicity**: deliver
 ## Testing
 
 ```bash
-npm ci --prefix example   # Node dependencies used by the build and CSS integration tests
+npm ci --prefix example   # Node dependencies used by the build, CSS and framework integration tests
 cargo test
 ```
 

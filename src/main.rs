@@ -30,6 +30,7 @@ mod alias;
 mod build;
 mod lib_build;
 mod css;
+mod framework;
 #[cfg(test)]
 mod test_util;
 
@@ -43,6 +44,7 @@ struct AppState {
     proxies: Arc<Vec<(String, String)>>,
     aliases: Arc<Vec<(String, String)>>,
     styles: Arc<css::StyleCache>,
+    solid: bool,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
@@ -113,19 +115,29 @@ const HMR_CLIENT: &str = r#"(() => {
       clearOverlay();
       console.log('[rush] hot update:', msg.path);
       const ctx = window.__rush_hot?.get(msg.path);
-      if (ctx?._disposeCallbacks) {
-        for (const cb of ctx._disposeCallbacks) {
-          try { cb(ctx.data); } catch (e) { console.error(e); }
-        }
-        ctx._disposeCallbacks = [];
+      if (!ctx) return;
+      const { _acceptCallbacks: accept, _disposeCallbacks: dispose } = ctx;
+      const styleRevision = ctx.data.rushStyleRevision;
+      ctx._acceptCallbacks = [];
+      ctx._disposeCallbacks = [];
+      for (const cb of dispose) {
+        try { cb(ctx.data); } catch (e) { console.error(e); }
       }
       import(`${msg.path}?t=${msg.timestamp}`).then(newMod => {
-        if (ctx?._acceptCallbacks) {
-          for (const cb of ctx._acceptCallbacks) {
-            try { cb(newMod); } catch (e) { console.error(e); }
-          }
+        if (styleRevision && styleRevision === ctx.data.rushStyleRevision) {
+          ctx._acceptCallbacks = accept;
+          return;
+        }
+        for (const cb of accept) {
+          try { cb(newMod); } catch (e) { console.error(e); }
         }
       }).catch(err => {
+        if (ctx.data.rushFramework) {
+          ctx._acceptCallbacks = accept;
+          ctx._disposeCallbacks = dispose;
+          console.error('[rush] component update failed:', err);
+          return;
+        }
         console.error('[rush] hot update failed, reloading:', err);
         location.reload();
       });
@@ -379,6 +391,29 @@ async fn request_middleware(
         state.graph.write().unwrap().update(&mod_path, &deps, is_accepting);
     };
 
+    if framework::handles(ext, state.solid) && target.is_file() {
+        let root = state.root.clone();
+        let result = tokio::task::spawn_blocking(move || framework::compile(&root, &target)).await;
+        let result = result.map_err(|error| error.to_string()).and_then(|result| result);
+        return match result {
+            Ok(component) => {
+                let fname = "component.js";
+                register_module(&component.code, fname);
+                let aliased = alias::resolve_aliases(&component.code, fname, &state.aliases);
+                let rewritten = resolve::rewrite_bare_imports(&aliased, fname, "/node_modules/.rush/deps");
+                let code = hmr::inject_hot_preamble(&rewritten, rel_path);
+                let code = env::replace_env_vars(&code, &state.env_vars);
+                ([(header::CONTENT_TYPE, "application/javascript")], code).into_response()
+            }
+            Err(error) => {
+                log::error(&format!("{rel_path}: {error}"));
+                let message = serde_json::json!({ "type": "error", "file": rel_path, "message": error });
+                state.tx.send(message.to_string()).ok();
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+            }
+        };
+    }
+
     // TS/TSX/JSX: transpile on the fly via oxc
     // ponytail: no caching of transpile results — files are small, oxc is microseconds.
     // Add in-memory cache if profiler says transpilation is the bottleneck.
@@ -616,7 +651,8 @@ async fn main() {
     }
 
     // Phase 3: Pre-bundle node_modules dependencies via esbuild
-    if let Err(e) = resolve::prebundle(&root) {
+    let solid = framework::solid(&root);
+    if let Err(e) = framework::prebundle(&root, solid) {
         log::warn(&format!("prebundle notice: {e}"));
     }
 
@@ -691,7 +727,7 @@ async fn main() {
                             "timestamp": now,
                         });
                         watcher_tx.send(msg.to_string()).ok();
-                    } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
+                    } else if matches!(ext, "js" | "ts" | "jsx" | "tsx" | "vue" | "svelte") {
                         let boundaries = watcher_graph.read().unwrap().find_update_boundaries(&rel);
                         if let Some(targets) = boundaries {
                             log::event("hot update:", &format!("{:?}", targets));
@@ -754,6 +790,7 @@ async fn main() {
         proxies,
         aliases,
         styles,
+        solid,
     };
 
     let app = Router::new()
