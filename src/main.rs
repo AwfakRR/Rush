@@ -15,6 +15,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -32,6 +33,7 @@ mod lib_build;
 mod css;
 mod framework;
 mod plugins;
+mod ssr;
 #[cfg(test)]
 mod test_util;
 
@@ -47,6 +49,7 @@ struct AppState {
     styles: Arc<css::StyleCache>,
     solid: bool,
     plugins: Option<Arc<plugins::DevPlugins>>,
+    ssr_version: Arc<AtomicU64>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
@@ -171,6 +174,13 @@ fn inject_hmr(html: &str) -> String {
 
 async fn hmr_client() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript")], HMR_CLIENT)
+}
+
+async fn ssr_version_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        state.ssr_version.load(Ordering::Relaxed).to_string(),
+    )
 }
 
 // Phase 15: React Fast Refresh runtime virtual module
@@ -306,8 +316,15 @@ async fn request_middleware(
                 Ok(resp) => {
                     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
                         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
                     let body = resp.bytes().await.unwrap_or_default();
-                    return (status, body).into_response();
+                    let mut response = (status, body).into_response();
+                    if let Some(content_type) = content_type {
+                        response
+                            .headers_mut()
+                            .insert(header::CONTENT_TYPE, content_type);
+                    }
+                    return response;
                 }
                 Err(e) => {
                     log::error(&format!("proxy error: {e}"));
@@ -555,6 +572,8 @@ struct CliArgs {
     build: bool,
     lib: bool,
     entry: Option<PathBuf>,
+    ssr: Option<PathBuf>,
+    ssr_transform: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
@@ -568,6 +587,8 @@ fn parse_args() -> CliArgs {
         build: false,
         lib: false,
         entry: None,
+        ssr: None,
+        ssr_transform: None,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -576,15 +597,29 @@ fn parse_args() -> CliArgs {
             "build" | "--build" => {
                 args_out.build = true;
             }
+            "ssr-transform" => {
+                i += 1;
+                if let Some(path) = args.get(i).filter(|path| !path.starts_with('-')) {
+                    args_out.ssr_transform = Some(PathBuf::from(path));
+                } else {
+                    log::error("ssr-transform requires an entry path");
+                    std::process::exit(1);
+                }
+            }
             "--lib" => {
                 args_out.lib = true;
             }
-            "--entry" => {
+            "--entry" | "--ssr" => {
+                let flag = &args[i];
                 i += 1;
                 if let Some(path) = args.get(i).filter(|path| !path.starts_with('-')) {
-                    args_out.entry = Some(PathBuf::from(path));
+                    if flag == "--ssr" {
+                        args_out.ssr = Some(PathBuf::from(path));
+                    } else {
+                        args_out.entry = Some(PathBuf::from(path));
+                    }
                 } else {
-                    log::error("--entry requires a path");
+                    log::error(&format!("{flag} requires a path"));
                     std::process::exit(1);
                 }
             }
@@ -613,6 +648,7 @@ fn parse_args() -> CliArgs {
             "--help" | "-h" => {
                 println!("Usage: rush [build] [--port <port>] [--root <dir>] [--open] [--https] [--proxy <prefix>=<target>]");
                 println!("       rush build --lib [--entry <path>] [--root <dir>]");
+                println!("       rush build --ssr <entry> [--root <dir>]");
                 std::process::exit(0);
             }
             _ => {}
@@ -621,6 +657,10 @@ fn parse_args() -> CliArgs {
     }
     if (args_out.lib && !args_out.build) || (args_out.entry.is_some() && !args_out.lib) {
         log::error("--lib requires build, and --entry requires build --lib");
+        std::process::exit(1);
+    }
+    if args_out.ssr.is_some() && (!args_out.build || args_out.lib) {
+        log::error("--ssr requires an app build and cannot be combined with --lib");
         std::process::exit(1);
     }
     args_out
@@ -672,12 +712,23 @@ async fn main() {
         }
     };
 
+    if let Some(entry) = &cli.ssr_transform {
+        match ssr::resolve_entry(&root, entry).and_then(|file| ssr::bundle(&root, &file, false)) {
+            Ok(code) => print!("{code}"),
+            Err(error) => {
+                log::error(&error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Phase 16: Production Build command
     if cli.build {
         let result = if cli.lib {
             lib_build::run_lib_build(&root, cli.entry.as_deref())
         } else {
-            build::run_build(&root)
+            build::run_build(&root, cli.ssr.as_deref())
         };
         if let Err(e) = result {
             log::error(&format!("build failed: {e}"));
@@ -703,12 +754,19 @@ async fn main() {
     let (tx, _rx) = broadcast::channel::<String>(16);
     let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
     let styles = Arc::new(css::StyleCache::default());
+    let ssr_version = Arc::new(AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    ));
 
     // Spawn debounced file watcher in background thread
     let watcher_root = root.clone();
     let watcher_tx = tx.clone();
     let watcher_graph = graph.clone();
     let watcher_styles = styles.clone();
+    let watcher_ssr_version = ssr_version.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(50));
@@ -732,6 +790,7 @@ async fn main() {
                 if events.is_empty() {
                     continue;
                 }
+                watcher_ssr_version.fetch_add(1, Ordering::Relaxed);
                 let has_postcss = css::configured(&watcher_root);
                 let postcss_affected = has_postcss || had_postcss;
                 had_postcss = has_postcss;
@@ -836,11 +895,13 @@ async fn main() {
         styles,
         solid,
         plugins,
+        ssr_version,
     };
 
     let app = Router::new()
         .route("/__hmr", get(ws_handler))
         .route("/__hmr.js", get(hmr_client))
+        .route("/__rush/ssr-version", get(ssr_version_handler))
         .route("/@react-refresh", get(react_refresh_runtime))
         .fallback_service(ServeDir::new(&state.root))
         .layer(from_fn_with_state(state.clone(), request_middleware))

@@ -22,10 +22,10 @@ function mergePluginConfig(base, extra) {
   return base;
 }
 
-async function loadRushPlugins(root, configFile, command) {
+async function loadRushPlugins(root, configFile, command, ssr = false) {
   const development = command === 'serve';
   const mode = development ? 'development' : 'production';
-  const env = { command, mode, isSsrBuild: false, isPreview: false };
+  const env = { command, mode, isSsrBuild: ssr && !development, isPreview: false };
   const requireFromRoot = pluginRequire(pluginPath.join(root, 'package.json'));
   const imported = (await import(pathToFileURL(configFile).href)).default;
   const userConfig = await (typeof imported === 'function' ? imported(env) : imported);
@@ -112,7 +112,7 @@ async function loadRushPlugins(root, configFile, command) {
     for (const plugin of hooks('resolveId')) {
       if (plugin === skip) continue;
       const result = await invoke(plugin, 'resolveId', [source, importer ?? undefined, {
-        isEntry: false, ...options, ssr: false,
+        isEntry: false, ...options, ssr,
       }], callData);
       if (typeof result === 'string') return { id: result };
       if (result === false) return { id: source, external: true };
@@ -129,7 +129,7 @@ async function loadRushPlugins(root, configFile, command) {
 
   async function load(id, callData) {
     for (const plugin of hooks('load')) {
-      const result = await invoke(plugin, 'load', [id, { ssr: false }], callData);
+      const result = await invoke(plugin, 'load', [id, { ssr }], callData);
       if (result != null) return sourceResult(result);
     }
     return null;
@@ -138,7 +138,7 @@ async function loadRushPlugins(root, configFile, command) {
   async function transform(source, id, initial = null, callData) {
     let result = initial;
     for (const plugin of hooks('transform')) {
-      const output = await invoke(plugin, 'transform', [result?.code ?? source, id, { ssr: false }], callData);
+      const output = await invoke(plugin, 'transform', [result?.code ?? source, id, { ssr }], callData);
       if (output != null) result = sourceResult(output);
     }
     return result;

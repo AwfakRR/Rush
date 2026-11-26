@@ -109,6 +109,15 @@ pub fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> Str
 /// Handles exports.".".import, exports.".".default, module, main, index.js.
 #[allow(dead_code)]
 pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf> {
+    let slash_count = if package_name.starts_with('@') { 2 } else { 1 };
+    let subpath = package_name.match_indices('/').nth(slash_count - 1);
+    let (package_name, export_key) = match subpath {
+        Some((index, _)) => (
+            &package_name[..index],
+            format!(".{}", &package_name[index..]),
+        ),
+        None => (package_name, ".".to_string()),
+    };
     let pkg_dir = root.join("node_modules").join(package_name);
     let pkg_json_path = pkg_dir.join("package.json");
     let raw = std::fs::read_to_string(&pkg_json_path).ok()?;
@@ -116,19 +125,24 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
 
     // 1. Check "exports" field
     if let Some(exports) = pkg.get("exports") {
-        if let Some(dot) = exports.get(".") {
+        if let Some(entry) = exports.get(&export_key) {
             for key in ["import", "default", "browser"] {
-                if let Some(p) = dot.get(key).and_then(|v| v.as_str()) {
+                if let Some(p) = entry.get(key).and_then(|v| v.as_str()) {
                     return Some(pkg_dir.join(p));
                 }
             }
-            if let Some(p) = dot.as_str() {
+            if let Some(p) = entry.as_str() {
                 return Some(pkg_dir.join(p));
             }
         }
-        if let Some(p) = exports.as_str() {
-            return Some(pkg_dir.join(p));
+        if export_key == "." {
+            if let Some(p) = exports.as_str() {
+                return Some(pkg_dir.join(p));
+            }
         }
+    }
+    if export_key != "." {
+        return None;
     }
 
     // 2. Check "module" field (standard for modern ESM builds)
@@ -495,6 +509,26 @@ export * from 'lodash-es';"#;
         assert_eq!(entry("module-field"), Some(Path::new("module-field/./m.js").to_path_buf()));
         assert_eq!(entry("main-field"), Some(Path::new("main-field/./main.js").to_path_buf()));
         assert_eq!(entry("@scope/pkg"), Some(Path::new("@scope/pkg/./scoped.js").to_path_buf()));
+    }
+
+    #[test]
+    fn test_resolve_package_export_subpaths() {
+        let dir = TempDir::new();
+        for name in ["react-dom", "@scope/pkg"] {
+            pkg(
+                &dir,
+                name,
+                r#"{"main":"./main.js","exports":{"./client":"./client.js"}}"#,
+            );
+            assert_eq!(
+                resolve_package_entry(dir.path(), &format!("{name}/client")),
+                Some(dir.path().join("node_modules").join(name).join("client.js")),
+            );
+            assert_eq!(
+                resolve_package_entry(dir.path(), &format!("{name}/private")),
+                None
+            );
+        }
     }
 
     #[test]

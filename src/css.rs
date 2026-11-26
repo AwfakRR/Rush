@@ -84,6 +84,7 @@ pub fn run_node<T: serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     let purpose = match action {
         "build" | "plugin-build" => "building the project",
+        "ssr" => "transforming the SSR entry",
         "style" => "CSS processing",
         _ => "framework compilation",
     };

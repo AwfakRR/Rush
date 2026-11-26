@@ -121,10 +121,11 @@ function rushPluginBridge(runner) {
   };
 }
 
-async function build(entries, outdir, configured, configFile) {
-  const esbuild = dependency('esbuild');
+async function build(entries, outdir, configured, configFile, ssr = false) {
+  const esbuild = dependency('esbuild', ssr ? 'SSR' : 'building the project');
   const processCss = await processor(configured);
-  const runner = configFile && await loadRushPlugins(root, configFile, 'build');
+  const command = ssr && process.env.NODE_ENV === 'development' ? 'serve' : 'build';
+  const runner = configFile && await loadRushPlugins(root, configFile, command, ssr);
   const options = {
     entryPoints: entries,
     outdir,
@@ -138,7 +139,7 @@ async function build(entries, outdir, configured, configFile) {
     chunkNames: '[name]-[hash]',
     assetNames: '[name]-[hash]',
     metafile: true,
-    plugins: [...(runner ? [rushPluginBridge(runner)] : []), frameworkPlugin(), {
+    plugins: [...(runner ? [rushPluginBridge(runner)] : []), ...(ssr ? [] : [frameworkPlugin()]), {
       name: 'rush-css',
       setup(build) {
         build.onResolve({ filter: /^rush-css:/, namespace: 'rush-css-module' }, (args) => ({
@@ -161,7 +162,7 @@ async function build(entries, outdir, configured, configFile) {
         build.onLoad({ filter: /.*/, namespace: 'rush-css-module' }, async ({ path: file }) => {
           const { exports } = await processCss(file);
           return {
-            contents: `import ${JSON.stringify('rush-css:' + file)};\n${exports}`,
+            contents: ssr ? exports : `import ${JSON.stringify('rush-css:' + file)};\n${exports}`,
             loader: 'js',
           };
         });
@@ -170,11 +171,26 @@ async function build(entries, outdir, configured, configFile) {
           loader: 'css',
           resolveDir: path.dirname(file),
         });
-        build.onLoad({ filter: /\.css$/, namespace: 'file' }, loadStyle);
+        build.onLoad({ filter: /\.css$/, namespace: 'file' }, ssr
+          ? () => ({ contents: '', loader: 'empty' })
+          : loadStyle);
         build.onLoad({ filter: /.*/, namespace: 'rush-css-style' }, loadStyle);
       },
     }],
   };
+  if (ssr) {
+    Object.assign(options, {
+      platform: 'node',
+      packages: 'external',
+      target: 'node20',
+      jsx: 'automatic',
+      splitting: false,
+      minify: command === 'build',
+      sourcemap: 'inline',
+      write: false,
+      metafile: false,
+    });
+  }
   let result;
   try {
     result = await esbuild.build(options);
@@ -184,9 +200,9 @@ async function build(entries, outdir, configured, configFile) {
   }
   if (runner) {
     await runner.buildEnd();
-    await runner.writeAssets(path.dirname(outdir));
+    if (!ssr) await runner.writeAssets(path.dirname(outdir));
   }
-  return result.metafile;
+  return ssr ? result.outputFiles[0].text : result.metafile;
 }
 
 async function main() {
@@ -195,6 +211,7 @@ async function main() {
   switch (action) {
     case 'build': output = await build(entries, file, configured === 'true'); break;
     case 'plugin-build': output = await build(entries.slice(1), file, configured === 'true', entries[0]); break;
+    case 'ssr': output = await build([file], undefined, configured === 'true', entries[0], true); break;
     case 'component': output = await devComponent(file); break;
     case 'scan-components': {
       output = [];

@@ -1,7 +1,7 @@
 use flate2::{read::GzEncoder, Compression};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs, io,
     path::{Path, PathBuf},
     time::Instant,
@@ -18,6 +18,12 @@ struct EsbuildMetadata {
 struct EsbuildOutput {
     entry_point: Option<String>,
     css_bundle: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ClientAssets {
+    script: String,
+    css: Vec<String>,
 }
 
 fn bundle(
@@ -134,7 +140,7 @@ pub fn extract_css_links(html: &str) -> Vec<String> {
 
 /// Run production build using esbuild.
 /// Bundles, minifies, generates sourcemaps, and outputs to `dist/`.
-pub fn run_build(root: &Path) -> Result<(), String> {
+pub fn run_build(root: &Path, ssr_entry: Option<&Path>) -> Result<(), String> {
     let start = Instant::now();
     crate::log::info(&format!("building for production from {}", root.display()));
 
@@ -172,6 +178,11 @@ pub fn run_build(root: &Path) -> Result<(), String> {
         return Err("could not find <script type=\"module\" src=\"...\"> in any HTML page".into());
     }
 
+    let server_bundle = ssr_entry
+        .map(|entry| crate::ssr::resolve_entry(root, entry))
+        .transpose()?
+        .map(|entry| crate::ssr::bundle(root, &entry, true))
+        .transpose()?;
     let dist_dir = root.join("dist");
     let assets_dir = dist_dir.join("assets");
     let _ = fs::remove_dir_all(&dist_dir);
@@ -201,9 +212,11 @@ pub fn run_build(root: &Path) -> Result<(), String> {
     };
 
     let postcss = crate::css::configured(root);
+    let mut manifest = BTreeMap::new();
     for (page, html, script) in pages {
         let links = extract_css_links(&html);
         let mut rewritten = html;
+        let mut css_urls = Vec::new();
         for href in links {
             if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("//")
             {
@@ -226,22 +239,46 @@ pub fn run_build(root: &Path) -> Result<(), String> {
                 fs::copy(&src, &dest).map(|_| ())
             };
             written.map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
-            rewritten = rewrite_attr(&rewritten, "href", &href, &format!("./{clean}"));
+            let url = format!("./{clean}");
+            rewritten = rewrite_attr(&rewritten, "href", &href, &url);
+            css_urls.push(url);
         }
         if let Some((src, entry)) = script {
             let (js, output) = outputs.get(&entry).ok_or_else(|| {
                 format!("no JavaScript bundle was generated for {}", entry.display())
             })?;
-            rewritten = rewrite_attr(&rewritten, "src", &src, &dist_url(js)?);
+            let script = dist_url(js)?;
+            rewritten = rewrite_attr(&rewritten, "src", &src, &script);
             if let Some(css) = &output.css_bundle {
-                let link = format!("<link rel=\"stylesheet\" href=\"{}\">\n", dist_url(css)?);
+                let url = dist_url(css)?;
+                let link = format!("<link rel=\"stylesheet\" href=\"{url}\">\n");
                 let end = rewritten.find("</head>").unwrap_or(0);
                 rewritten.insert_str(end, &link);
+                css_urls.push(url);
+            }
+            if server_bundle.is_some() {
+                manifest.insert(
+                    page.file_name().unwrap().to_string_lossy().into_owned(),
+                    ClientAssets {
+                        script,
+                        css: css_urls,
+                    },
+                );
             }
         }
         let dest = dist_dir.join(page.file_name().unwrap());
         fs::write(&dest, rewritten)
             .map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
+    }
+
+    if let Some(bundle) = server_bundle {
+        let server_dir = dist_dir.join("server");
+        let manifest = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("failed to serialize SSR client manifest: {e}"))?;
+        fs::create_dir_all(&server_dir)
+            .and_then(|()| fs::write(server_dir.join("entry.mjs"), bundle))
+            .and_then(|()| fs::write(dist_dir.join("ssr-manifest.json"), manifest))
+            .map_err(|e| format!("failed to write SSR output: {e}"))?;
     }
 
     let public_dir = root.join("public");
@@ -358,12 +395,18 @@ mod tests {
     #[test]
     fn test_run_build_errors() {
         let dir = TempDir::new();
-        assert!(run_build(dir.path()).unwrap_err().contains("index.html not found"));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("index.html not found"));
 
         dir.write("index.html", "<html><body></body></html>");
-        assert!(run_build(dir.path()).unwrap_err().contains("<script type=\"module\""));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("<script type=\"module\""));
 
         dir.write("index.html", r#"<script type="module" src="/missing.js"></script>"#);
-        assert!(run_build(dir.path()).unwrap_err().contains("entry script file not found"));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("entry script file not found"));
     }
 }
