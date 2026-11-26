@@ -28,6 +28,7 @@ mod log;
 mod env;
 mod alias;
 mod build;
+mod lib_build;
 mod css;
 #[cfg(test)]
 mod test_util;
@@ -481,6 +482,8 @@ struct CliArgs {
     proxies: Vec<(String, String)>,
     https: bool,
     build: bool,
+    lib: bool,
+    entry: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
@@ -492,6 +495,8 @@ fn parse_args() -> CliArgs {
         proxies: Vec::new(),
         https: false,
         build: false,
+        lib: false,
+        entry: None,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -499,6 +504,18 @@ fn parse_args() -> CliArgs {
         match args[i].as_str() {
             "build" | "--build" => {
                 args_out.build = true;
+            }
+            "--lib" => {
+                args_out.lib = true;
+            }
+            "--entry" => {
+                i += 1;
+                if let Some(path) = args.get(i).filter(|path| !path.starts_with('-')) {
+                    args_out.entry = Some(PathBuf::from(path));
+                } else {
+                    log::error("--entry requires a path");
+                    std::process::exit(1);
+                }
             }
             "--port" | "-p" if i + 1 < args.len() => {
                 args_out.port = args[i + 1].parse().unwrap_or(3000);
@@ -524,11 +541,16 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 println!("Usage: rush [build] [--port <port>] [--root <dir>] [--open] [--https] [--proxy <prefix>=<target>]");
+                println!("       rush build --lib [--entry <path>] [--root <dir>]");
                 std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
+    }
+    if (args_out.lib && !args_out.build) || (args_out.entry.is_some() && !args_out.lib) {
+        log::error("--lib requires build, and --entry requires build --lib");
+        std::process::exit(1);
     }
     args_out
 }
@@ -581,7 +603,12 @@ async fn main() {
 
     // Phase 16: Production Build command
     if cli.build {
-        if let Err(e) = build::run_build(&root) {
+        let result = if cli.lib {
+            lib_build::run_lib_build(&root, cli.entry.as_deref())
+        } else {
+            build::run_build(&root)
+        };
+        if let Err(e) = result {
             log::error(&format!("build failed: {e}"));
             std::process::exit(1);
         }

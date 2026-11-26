@@ -253,9 +253,12 @@ pub fn run_build(root: &Path) -> Result<(), String> {
         }
     }
 
+    print_build_summary(root, &dist_dir, start)
+}
+
+pub(crate) fn print_build_summary(root: &Path, dist: &Path, start: Instant) -> Result<(), String> {
     let mut sizes = Vec::new();
-    collect_sizes(&dist_dir, &mut sizes)
-        .map_err(|e| format!("failed to measure output files: {e}"))?;
+    collect_sizes(dist, &mut sizes).map_err(|e| format!("failed to measure output files: {e}"))?;
     sizes.sort_unstable();
     let elapsed = start.elapsed().as_millis();
     println!();

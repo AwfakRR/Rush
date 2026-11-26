@@ -1261,8 +1261,10 @@ checksum = "40c1a35009a2f553b1f482c6f9f32aac8af4773abb0cbcb3378af689b90e23ae"
 dependencies = [
  "oxc_allocator",
  "oxc_ast",
+ "oxc_ast_visit",
  "oxc_codegen",
  "oxc_diagnostics",
+ "oxc_isolated_declarations",
  "oxc_parser",
  "oxc_regular_expression",
  "oxc_semantic",
@@ -1434,6 +1436,24 @@ checksum = "191884bee6c3744909a51acc7d78d4ae370d817b25875b10642f632327b6296e"
 dependencies = [
  "nonmax",
  "serde",
+]
+
+[[package]]
+name = "oxc_isolated_declarations"
+version = "0.151.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3adbfced895229e56d8eb4596411c6e9bd824ec299974580894cec6fb6b943c"
+dependencies = [
+ "bitflags 2.13.2",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_diagnostics",
+ "oxc_ecmascript",
+ "oxc_span",
+ "oxc_str",
+ "oxc_syntax",
+ "rustc-hash",
 ]
 
 [[package]]
