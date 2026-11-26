@@ -93,6 +93,35 @@ async fn self_accepting_module_hot_updates_itself() {
 }
 
 #[tokio::test]
+async fn react_component_hot_updates_without_manual_acceptance() {
+    let initial =
+        "import { label } from './label.ts';\nexport function App() { return <p>{label}</p>; }\n";
+    let f = project();
+    f.write("App.tsx", initial);
+    let (s, mut ws) = start(&f).await;
+    assert!(s
+        .get_text("/App.tsx")
+        .await
+        .contains("import.meta.hot._refreshUrl = import.meta.url"));
+    assert!(!s.get_text("/label.ts").await.contains("/@react-refresh"));
+
+    let updated = initial
+        .replace("<p>", "<strong>")
+        .replace("</p>", "</strong>");
+    let msgs = edit_and_collect(&f, &mut ws, "App.tsx", &updated).await;
+    assert_eq!(kinds(&msgs), vec![pair("js-update", "/App.tsx")]);
+
+    let msgs = edit_and_collect(&f, &mut ws, "label.ts", "export const label = 'new';").await;
+    assert_eq!(kinds(&msgs), vec![pair("js-update", "/App.tsx")]);
+    let timestamp = msgs.last().unwrap()["timestamp"].as_u64().unwrap();
+    let updated = s.get_text(&format!("/App.tsx?t={timestamp}")).await;
+    assert!(
+        updated.contains(&format!("from \"./label.ts?t={timestamp}\"")),
+        "{updated}"
+    );
+}
+
+#[tokio::test]
 async fn dependency_change_propagates_to_accepting_importers() {
     // util.ts is imported by counter.ts ('./util.ts') and App.tsx ('./nested/../util.ts'), both accepting.
     let f = project();

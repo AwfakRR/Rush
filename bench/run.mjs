@@ -218,6 +218,7 @@ async function main() {
     options: {
       components: { type: 'string', default: defaultComponents },
       runs: { type: 'string', default: '5' },
+      'assert-rush-refresh': { type: 'boolean', default: false },
     },
   });
   const components = integer(values.components, '--components', 2);
@@ -249,6 +250,14 @@ async function main() {
   await mkdir(join(bench, 'results'), { recursive: true });
   await writeFile(output, JSON.stringify({ started, components, leaves: fixture.leaves, runs, ...environment, samples, summary }, null, 2) + '\n');
   console.log(`\n${table(summary, runs)}\n\nResults: ${output}`);
+  if (values['assert-rush-refresh']) {
+    for (const [edit, result] of Object.entries({ root: summary.Rush.root, leaf: summary.Rush.leaf })) {
+      if (result.reloadRuns !== 0 || result.statePreservedRuns !== runs) {
+        throw new Error(`Rush ${edit} edit did not preserve state without reloads in every run`);
+      }
+    }
+    console.log('Rush React Fast Refresh passed for every root and leaf edit.');
+  }
 }
 
 await main().catch((error) => {

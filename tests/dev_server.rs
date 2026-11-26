@@ -56,6 +56,13 @@ async fn serves_html_with_hmr_client_injected() {
 
     let refresh = s.get_text("/@react-refresh").await;
     assert!(refresh.contains("performReactRefresh"));
+    assert!(refresh.contains("createSignatureFunctionForTransform"));
+    assert!(refresh.contains("scheduleRefresh"));
+    assert!(
+        html.find("refresh.injectIntoGlobalHook(window)").unwrap()
+            < html.find(r#"src="/main.js""#).unwrap(),
+        "{html}"
+    );
 }
 
 #[tokio::test]
@@ -91,6 +98,14 @@ async fn transpiles_tsx_and_resolves_imports() {
     assert!(code.starts_with("// [rush] HMR context"), "{code}");
     assert!(code.contains("window.__rush_hot.get('/app.tsx')"), "{code}");
     assert!(code.contains("$RefreshReg$"), "{code}");
+    assert!(
+        code.contains(r#"import __rush_refresh from "/@react-refresh""#),
+        "{code}"
+    );
+    assert!(
+        code.contains("import.meta.hot._refreshUrl = import.meta.url"),
+        "{code}"
+    );
     assert!(code.contains(r#""development""#), "{code}");
     assert!(code.contains("//# sourceMappingURL=/app.tsx.map"), "{code}");
 

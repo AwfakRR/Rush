@@ -42,7 +42,9 @@ struct AppState {
     aliases: Arc<Vec<(String, String)>>,
 }
 
-const HMR_CLIENT: &str = r#"(() => {
+const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
+
+(() => {
   // Phase 7: Error overlay helpers
   // ponytail: inline DOM creation, no framework, no shadow DOM. CSS scoped by id.
   function showOverlay(msg) {
@@ -60,12 +62,13 @@ const HMR_CLIENT: &str = r#"(() => {
     document.getElementById('__rush_error')?.remove();
   }
 
-  // Phase 15: React Fast Refresh runtime hooks
-  window.$RefreshReg$ = window.$RefreshReg$ || ((type, id) => {
-    window.__rush_refresh_registry = window.__rush_refresh_registry || new Map();
-    window.__rush_refresh_registry.set(id, type);
-  });
-  window.$RefreshSig$ = window.$RefreshSig$ || (() => (type) => type);
+  let refreshTimer;
+  function canRefresh(previous, next) {
+    const names = Object.keys(previous);
+    return names.length > 0 && names.length === Object.keys(next).length &&
+      names.every(name => refresh.isLikelyComponentType(previous[name]) &&
+        refresh.isLikelyComponentType(next[name]));
+  }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${proto}//${location.host}/__hmr`);
@@ -94,13 +97,24 @@ const HMR_CLIENT: &str = r#"(() => {
       clearOverlay();
       console.log('[rush] hot update:', msg.path);
       const ctx = window.__rush_hot?.get(msg.path);
+      const previousUrl = ctx?._refreshUrl;
       if (ctx?._disposeCallbacks) {
         for (const cb of ctx._disposeCallbacks) {
           try { cb(ctx.data); } catch (e) { console.error(e); }
         }
         ctx._disposeCallbacks = [];
       }
-      import(`${msg.path}?t=${msg.timestamp}`).then(newMod => {
+      const nextUrl = `${msg.path}?t=${msg.timestamp}`;
+      import(nextUrl).then(async newMod => {
+        if (previousUrl) {
+          if (ctx._refreshUrl !== new URL(nextUrl, location.href).href ||
+              !canRefresh(await import(previousUrl), newMod)) {
+            location.reload();
+            return;
+          }
+          clearTimeout(refreshTimer);
+          refreshTimer = setTimeout(() => refresh.performReactRefresh(), 16);
+        }
         if (ctx?._acceptCallbacks) {
           for (const cb of ctx._acceptCallbacks) {
             try { cb(newMod); } catch (e) { console.error(e); }
@@ -123,37 +137,32 @@ const HMR_CLIENT: &str = r#"(() => {
 })();"#;
 
 fn inject_hmr(html: &str) -> String {
-    let script = r#"<script type="module" src="/__hmr.js"></script>"#;
+    let script = r#"<script type="module">
+import refresh from '/@react-refresh';
+refresh.injectIntoGlobalHook(window);
+window.$RefreshReg$ = () => {};
+window.$RefreshSig$ = () => type => type;
+</script>
+<script type="module" src="/__hmr.js"></script>"#;
     // ponytail: simple string search, no HTML parser needed
-    if let Some(pos) = html.find("</head>") {
-        let (before, after) = html.split_at(pos);
-        format!("{before}{script}\n{after}")
-    } else if let Some(pos) = html.find("</body>") {
-        let (before, after) = html.split_at(pos);
-        format!("{before}{script}\n{after}")
-    } else {
-        format!("{script}\n{html}")
-    }
+    let lower = html.to_ascii_lowercase();
+    let pos = ["<script", "</head>", "</body>"]
+        .iter()
+        .filter_map(|tag| lower.find(tag))
+        .min()
+        .unwrap_or(0);
+    let (before, after) = html.split_at(pos);
+    format!("{before}{script}\n{after}")
 }
 
 async fn hmr_client() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript")], HMR_CLIENT)
 }
 
-// Phase 15: React Fast Refresh runtime virtual module
 async fn react_refresh_runtime() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        r#"
-let isMounted = false;
-export default {
-  injectIntoGlobalHook(window) {},
-  register(type, id) {
-    if (window.$RefreshReg$) window.$RefreshReg$(type, id);
-  },
-  performReactRefresh() {},
-};
-"#,
+        include_str!("../assets/react-refresh.js"),
     )
 }
 
@@ -263,21 +272,25 @@ async fn request_middleware(
     }
 
     // Helper to register module dependencies into ModuleGraph
-    let register_module = |source: &str, fname: &str| {
-        let is_accepting = hmr::has_hot_accept(source);
-        // Scan after alias rewriting so `@/x` imports land in the graph like `./x`.
-        let aliased = alias::resolve_aliases(source, fname, &state.aliases);
-        let raw_imports = resolve::scan_imports(&aliased, fname);
-        let parent = Path::new(rel_path).parent().unwrap_or(Path::new(""));
-        let mut deps = Vec::new();
-        for (spec, _, _) in raw_imports {
-            if spec.starts_with('.') {
-                let resolved = parent.join(spec);
-                deps.push(hmr::normalize_path(&resolved.to_string_lossy()));
-            }
-        }
+    let prepare_module = |code: &str, fname: &str, is_accepting| {
         let mod_path = hmr::normalize_path(rel_path);
-        state.graph.write().unwrap().update(&mod_path, &deps, is_accepting);
+        let aliased = alias::resolve_aliases(code, fname, &state.aliases);
+        let imports = resolve::scan_imports(&aliased, fname);
+        let deps: Vec<_> = imports
+            .iter()
+            .filter_map(|(spec, _, _)| hmr::local_import_path(&mod_path, spec))
+            .collect();
+        let mut graph = state.graph.write().unwrap();
+        graph.update(&mod_path, &deps, is_accepting);
+        let rewritten = resolve::rewrite_imports(&aliased, imports, |specifier| {
+            if resolve::is_bare(specifier) {
+                Some(resolve::dep_url("/node_modules/.rush/deps", specifier))
+            } else {
+                let path = hmr::local_import_path(&mod_path, specifier)?;
+                graph.updated_import(specifier, &path)
+            }
+        });
+        (rewritten, mod_path)
     };
 
     // TS/TSX/JSX: transpile on the fly via oxc
@@ -286,18 +299,23 @@ async fn request_middleware(
     if target.is_file() && matches!(ext, "ts" | "tsx" | "jsx") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
-            register_module(&source, &fname);
             match transform::transpile(&fname, &source) {
-                Ok((code, _map)) => {
-                    // Phase 11: Resolve path aliases before bare import rewriting
-                    let aliased = alias::resolve_aliases(&code, &fname, &state.aliases);
-                    // Phase 2: Rewrite bare imports before serving to browser
-                    let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
-                    // Phase 4: Inject import.meta.hot preamble
-                    let mod_path = hmr::normalize_path(rel_path);
+                Ok(transformed) => {
+                    let explicit = hmr::has_hot_accept(&source);
+                    let (mut rewritten, mod_path) = prepare_module(
+                        &transformed.code,
+                        &fname,
+                        explicit || transformed.refresh_registration,
+                    );
+                    if transformed.refresh_registration || transformed.refresh_signature {
+                        rewritten = hmr::inject_refresh_preamble(
+                            &rewritten,
+                            transformed.refresh_registration && !explicit,
+                        );
+                    }
                     let mut with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
                     // Phase 5: Cache source map and append sourceMappingURL
-                    if let Some(map_json) = _map {
+                    if let Some(map_json) = transformed.map {
                         let map_path = format!("{mod_path}.map");
                         state.source_maps.write().unwrap().insert(map_path.clone(), map_json);
                         with_hmr.push_str(&format!("\n//# sourceMappingURL={map_path}\n"));
@@ -331,12 +349,8 @@ async fn request_middleware(
     if target.is_file() && ext == "js" {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
-            register_module(&source, &fname);
-            // Phase 11: Resolve path aliases before bare import rewriting
-            let aliased = alias::resolve_aliases(&source, &fname, &state.aliases);
-            let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
-            // Phase 4: Inject import.meta.hot preamble
-            let mod_path = hmr::normalize_path(rel_path);
+            let (rewritten, mod_path) =
+                prepare_module(&source, &fname, hmr::has_hot_accept(&source));
             let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
             // Phase 9: Replace import.meta.env.* references
             let final_code = env::replace_env_vars(&with_hmr, &state.env_vars);
@@ -546,7 +560,7 @@ async fn main() {
                         });
                         watcher_tx.send(msg.to_string()).ok();
                     } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
-                        let boundaries = watcher_graph.read().unwrap().find_update_boundaries(&rel);
+                        let boundaries = watcher_graph.write().unwrap().invalidate(&rel, now);
                         if let Some(targets) = boundaries {
                             log::event("hot update:", &format!("{:?}", targets));
                             for target in targets {

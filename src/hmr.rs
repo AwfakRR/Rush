@@ -8,8 +8,9 @@ pub struct ModuleGraph {
     imports: HashMap<String, HashSet<String>>,
     /// module_path -> set of modules that import it (reverse index)
     importers: HashMap<String, HashSet<String>>,
-    /// modules that have registered import.meta.hot.accept()
+    /// modules with explicit HMR acceptance or React Refresh registrations
     accepting: HashSet<String>,
+    versions: HashMap<String, u128>,
 }
 
 impl ModuleGraph {
@@ -48,12 +49,12 @@ impl ModuleGraph {
 
     /// Find which module(s) can handle the update without full reload.
     /// ponytail: BFS with max depth 50. If no self-accepting boundary, falls back to full reload.
-    pub fn find_update_boundaries(&self, changed: &str) -> Option<Vec<String>> {
+    fn update_boundaries(&self, changed: &str) -> Option<(Vec<String>, HashSet<String>)> {
         let changed_key = normalize_path(changed);
 
         // If the changed module accepts itself, update it directly
         if self.accepting.contains(&changed_key) {
-            return Some(vec![changed_key]);
+            return Some((vec![changed_key.clone()], HashSet::from([changed_key])));
         }
 
         let mut boundaries = Vec::new();
@@ -89,8 +90,39 @@ impl ModuleGraph {
         } else {
             boundaries.sort();
             boundaries.dedup();
-            Some(boundaries)
+            visited.extend(boundaries.iter().cloned());
+            Some((boundaries, visited))
         }
+    }
+
+    #[cfg(test)]
+    fn find_update_boundaries(&self, changed: &str) -> Option<Vec<String>> {
+        self.update_boundaries(changed)
+            .map(|(boundaries, _)| boundaries)
+    }
+
+    pub fn invalidate(&mut self, changed: &str, timestamp: u128) -> Option<Vec<String>> {
+        let (boundaries, invalidated) = self.update_boundaries(changed)?;
+        self.versions
+            .extend(invalidated.into_iter().map(|path| (path, timestamp)));
+        Some(boundaries)
+    }
+
+    pub fn updated_import(&self, specifier: &str, path: &str) -> Option<String> {
+        self.versions
+            .get(path)
+            .map(|version| format!("{specifier}?t={version}"))
+    }
+}
+
+pub fn local_import_path(module: &str, specifier: &str) -> Option<String> {
+    if specifier.starts_with("./") || specifier.starts_with("../") {
+        let parent = module.rsplit_once('/').map_or("", |(parent, _)| parent);
+        Some(normalize_path(&format!("{parent}/{specifier}")))
+    } else if specifier.starts_with('/') && !specifier.starts_with("//") {
+        Some(normalize_path(specifier))
+    } else {
+        None
     }
 }
 
@@ -116,7 +148,7 @@ pub fn has_hot_accept(source: &str) -> bool {
 }
 
 pub fn inject_hot_preamble(source: &str, module_path: &str) -> String {
-    let norm = normalize_path(module_path);
+    let norm = normalize_path(module_path).replace('\'', "\\'");
     // ponytail: client-side HMR context wrapper attached to import.meta.hot
     let preamble = format!(
         r#"// [rush] HMR context
@@ -131,10 +163,26 @@ let __rush_ctx = window.__rush_hot.get('{norm}') || {{
 }};
 window.__rush_hot.set('{norm}', __rush_ctx);
 import.meta.hot = __rush_ctx;
+__rush_ctx._refreshUrl = undefined;
 "#
     );
 
     format!("{preamble}\n{source}")
+}
+
+pub fn inject_refresh_preamble(source: &str, automatic_boundary: bool) -> String {
+    let boundary = if automatic_boundary {
+        "import.meta.hot._refreshUrl = import.meta.url;\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"import __rush_refresh from "/@react-refresh";
+const $RefreshReg$ = (type, id) => __rush_refresh.register(type, JSON.stringify([new URL(import.meta.url).pathname, id]));
+const $RefreshSig$ = __rush_refresh.createSignatureFunctionForTransform;
+{source}
+{boundary}"#
+    )
 }
 
 #[cfg(test)]
@@ -182,6 +230,27 @@ mod tests {
         graph.update("/App.tsx", &["/Page.tsx".to_string()], true);
         graph.update("/Page.tsx", &["/utils.ts".to_string()], false);
         assert_eq!(graph.find_update_boundaries("/utils.ts"), Some(vec!["/App.tsx".to_string()]));
+    }
+
+    #[test]
+    fn invalidation_versions_dependencies_through_the_boundary() {
+        let mut graph = ModuleGraph::new();
+        graph.update("/App.tsx", &["/Page.tsx".to_string()], true);
+        graph.update("/Page.tsx", &["/utils.ts".to_string()], false);
+        assert_eq!(
+            graph.invalidate("/utils.ts", 42),
+            Some(vec!["/App.tsx".to_string()])
+        );
+        assert_eq!(
+            graph.updated_import("./Page.tsx", "/Page.tsx").as_deref(),
+            Some("./Page.tsx?t=42")
+        );
+        assert_eq!(
+            graph.updated_import("./utils.ts", "/utils.ts").as_deref(),
+            Some("./utils.ts?t=42")
+        );
+        assert_eq!(graph.invalidate("/orphan.ts", 43), None);
+        assert_eq!(graph.updated_import("./orphan.ts", "/orphan.ts"), None);
     }
 
     #[test]
