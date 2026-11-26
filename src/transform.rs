@@ -24,9 +24,7 @@ fn parse<'a>(
     let source_type = SourceType::from_path(Path::new(filename))
         .map_err(|e| format!("Unknown file type {filename}: {e}"))?;
     let parsed = Parser::new(allocator, source, source_type).parse();
-    // ponytail: oxc parser is error-recovering. Only fail if AST body is completely empty with errors.
-    if parsed.program.body.is_empty() && !parsed.diagnostics.is_empty() && !source.trim().is_empty()
-    {
+    if !parsed.diagnostics.is_empty() {
         return Err(format!(
             "Parse error in {filename}: {:?}",
             parsed.diagnostics
@@ -173,6 +171,13 @@ mod tests {
     #[test]
     fn test_fatal_parse_error_errors() {
         assert!(transpile("broken.ts", "const = ;").is_err());
+    }
+
+    #[test]
+    fn test_recoverable_parse_error_errors() {
+        let source = "export const value = 1_;";
+        assert!(check_syntax("broken.ts", source).is_err());
+        assert!(transpile("broken.ts", source).is_err());
     }
 
     #[test]

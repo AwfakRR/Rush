@@ -1,0 +1,8 @@
+.card {
+  text-align: center;
+  background: linear-gradient(160deg, #1e293b, #162036);
+  padding: 2.5rem 3.5rem;
+  border-radius: 1rem;
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4);
+  border: 1px solid #334155;
+}
