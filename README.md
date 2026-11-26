@@ -74,6 +74,7 @@ cargo build --release
 | Command / Flag | Short | Default | Description |
 |---|---|---|---|
 | `rush build` | - | - | Bundle project for production into `dist/` |
+| `rush build --lib [--entry <path>]` | - | - | Bundle a library and emit TypeScript declarations into `dist/` |
 | `--port <port>` | `-p` | `3000` | Port for the HTTP and WebSocket server |
 | `--root <dir>` | `-r` | `.` | Root directory containing static files and source code |
 | `--open` | `-o` | - | Auto-open browser on server start |
@@ -101,6 +102,36 @@ by multiple entries can be shared between pages. The build report lists the raw 
 gzip-compressed size of each output file in KiB; it does not write `.gz` files.
 In the example, click **Load lazy chunk** to see the filename loaded by the browser, or
 follow **About this build** to open the second page and its own JavaScript entry.
+
+### Library Mode
+
+`rush build --lib [--entry <path>] [--root <dir>]` uses the explicit entry (relative
+to the root), the `source` field in `package.json`, or the first existing
+`src/index.{ts,tsx,mts,js,jsx,mjs}`, in that order. It replaces the contents of
+`dist/` with `<entry-stem>.mjs`, `<entry-stem>.cjs`, their source maps, and
+declarations for a TypeScript entry. Runtime, peer, and optional dependencies
+(including their subpaths) and `node:` imports remain external; imported
+development dependencies are bundled.
+
+Use explicit types for exported APIs where TypeScript's isolated declaration
+rules require them. Keep relative TypeScript modules under the entry's
+directory so their layout can be preserved in `dist/`. JavaScript entries
+are bundled without declarations. Rush emits `.d.ts` files and matching
+`.d.mts` and `.d.cts` files for the ESM and CommonJS export conditions.
+See [the example's package.json](example-lib/package.json) for the export map;
+Rush does not edit your manifest.
+
+From the repository root, build the example and run both consumers:
+
+```bash
+npm ci --prefix example          # provides esbuild for this checkout
+npm ci --prefix example-lib      # installs the example's local dependency
+PATH="$PWD/example/node_modules/.bin:$PATH" cargo run -- build --lib --root example-lib
+node example-lib/consumer/esm.mjs # Hello, ESM: 42
+node example-lib/consumer/cjs.cjs # Hello, CJS: 42
+npx --yes --package typescript tsc --noEmit --strict --module node16 \
+  example-lib/consumer/check.ts example-lib/consumer/check.cts
+```
 
 ### HTTPS Example
 
