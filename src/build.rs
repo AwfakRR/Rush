@@ -1,9 +1,11 @@
+use flate2::{read::GzEncoder, Compression};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    path::Path,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs, io,
+    path::{Path, PathBuf},
     time::Instant,
 };
-use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct EsbuildMetadata {
@@ -18,28 +20,52 @@ struct EsbuildOutput {
     css_bundle: Option<String>,
 }
 
-fn bundle(root: &Path, entry: &Path, assets: &Path) -> Result<EsbuildMetadata, String> {
+#[derive(Serialize)]
+struct ClientAssets {
+    script: String,
+    css: Vec<String>,
+}
+
+fn bundle(
+    root: &Path,
+    entries: &BTreeSet<PathBuf>,
+    assets: &Path,
+) -> Result<EsbuildMetadata, String> {
     let configured = crate::css::configured(root);
+    let config = crate::plugins::find_config(root);
     if root.join("node_modules/esbuild/package.json").is_file() {
-        return crate::css::run_node(root, "build", configured, true, &[entry, assets]);
+        let paths: Vec<_> = std::iter::once(assets)
+            .chain(config.iter().map(PathBuf::as_path))
+            .chain(entries.iter().map(PathBuf::as_path))
+            .collect();
+        let action = if config.is_some() { "plugin-build" } else { "build" };
+        return crate::css::run_node(root, action, configured, true, &paths);
+    }
+    if config.is_some() {
+        return Err("plugin builds require the project's esbuild package. Run npm install -D esbuild.".into());
     }
     if configured {
-        return Err("PostCSS builds require the project's esbuild package. Run npm install -D esbuild.".into());
+        return Err(
+            "PostCSS builds require the project's esbuild package. Run npm install -D esbuild."
+                .into(),
+        );
     }
 
     let esbuild = crate::resolve::find_esbuild(root)?;
     let metafile = assets.join(".rush-metafile.json");
     let output = std::process::Command::new(esbuild)
         .current_dir(root)
-        .arg(entry)
+        .args(entries)
         .args([
             "--bundle",
+            "--splitting",
             "--minify",
             "--format=esm",
             "--sourcemap",
             "--target=es2020",
             &format!("--outdir={}", assets.display()),
             "--entry-names=[name]-[hash]",
+            "--chunk-names=[name]-[hash]",
             "--asset-names=[name]-[hash]",
             &format!("--metafile={}", metafile.display()),
         ])
@@ -49,17 +75,25 @@ fn bundle(root: &Path, entry: &Path, assets: &Path) -> Result<EsbuildMetadata, S
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("esbuild build failed:\n{stderr}"));
     }
-    let json = std::fs::read(&metafile).map_err(|e| format!("failed to read esbuild metadata: {e}"))?;
+    let json =
+        std::fs::read(&metafile).map_err(|e| format!("failed to read esbuild metadata: {e}"))?;
     let _ = std::fs::remove_file(&metafile);
-    let metadata: EsbuildMetadata = serde_json::from_slice(&json)
-        .map_err(|e| format!("invalid esbuild metadata: {e}"))?;
-    if metadata.inputs.keys().any(|input| input.ends_with(".module.css")) {
-        return Err("CSS Modules builds require the project's esbuild package. Run npm install -D esbuild.".into());
+    let metadata: EsbuildMetadata =
+        serde_json::from_slice(&json).map_err(|e| format!("invalid esbuild metadata: {e}"))?;
+    if metadata
+        .inputs
+        .keys()
+        .any(|input| input.ends_with(".module.css"))
+    {
+        return Err(
+            "CSS Modules builds require the project's esbuild package. Run npm install -D esbuild."
+                .into(),
+        );
     }
     Ok(metadata)
 }
 
-/// Extract entry script source from index.html `<script type="module" src="...">`
+/// Extract entry script source from an HTML page's `<script type="module" src="...">`
 /// ponytail: simple string scan without full HTML AST parser.
 pub fn extract_script_entry(html: &str) -> Option<String> {
     for tag in html.split("<script").skip(1) {
@@ -80,7 +114,7 @@ pub fn extract_script_entry(html: &str) -> Option<String> {
     None
 }
 
-/// Extract linked stylesheets from index.html `<link rel="stylesheet" href="...">`
+/// Extract linked stylesheets from an HTML page's `<link rel="stylesheet" href="...">`
 pub fn extract_css_links(html: &str) -> Vec<String> {
     let mut links = Vec::new();
     for tag in html.split("<link").skip(1) {
@@ -106,141 +140,218 @@ pub fn extract_css_links(html: &str) -> Vec<String> {
 
 /// Run production build using esbuild.
 /// Bundles, minifies, generates sourcemaps, and outputs to `dist/`.
-pub fn run_build(root: &Path) -> Result<(), String> {
+pub fn run_build(root: &Path, ssr_entry: Option<&Path>) -> Result<(), String> {
     let start = Instant::now();
     crate::log::info(&format!("building for production from {}", root.display()));
 
-    let index_path = root.join("index.html");
-    if !index_path.is_file() {
-        return Err(format!("index.html not found in {}", root.display()));
+    let read_dir_error = |e: io::Error| format!("failed to read {}: {e}", root.display());
+    let mut pages = Vec::new();
+    let mut entries = BTreeSet::new();
+    for item in fs::read_dir(root).map_err(read_dir_error)? {
+        let path = item.map_err(read_dir_error)?.path();
+        if path.extension().is_none_or(|ext| ext != "html") || !path.is_file() {
+            continue;
+        }
+        let html = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let script = extract_script_entry(&html)
+            .map(|src| {
+                let file = root.join(src.trim_start_matches('/'));
+                let entry = file
+                    .canonicalize()
+                    .ok()
+                    .filter(|path| path.is_file())
+                    .ok_or_else(|| format!("entry script file not found: {}", file.display()))?;
+                entries.insert(entry.clone());
+                Ok::<_, String>((src, entry))
+            })
+            .transpose()?;
+        pages.push((path, html, script));
+    }
+    if pages.is_empty() {
+        return Err(format!(
+            "index.html not found (no root HTML pages) in {}",
+            root.display()
+        ));
+    }
+    if entries.is_empty() {
+        return Err("could not find <script type=\"module\" src=\"...\"> in any HTML page".into());
     }
 
-    let html_content = std::fs::read_to_string(&index_path)
-        .map_err(|e| format!("failed to read index.html: {e}"))?;
-
-    let script_entry = extract_script_entry(&html_content)
-        .ok_or_else(|| "could not find <script type=\"module\" src=\"...\"> in index.html".to_string())?;
-
-    let clean_script = script_entry.trim_start_matches('/');
-    let entry_file = root.join(clean_script);
-    if !entry_file.is_file() {
-        return Err(format!("entry script file not found: {}", entry_file.display()));
-    }
-
-    // 1. Prepare dist/ directory
+    let server_bundle = ssr_entry
+        .map(|entry| crate::ssr::resolve_entry(root, entry))
+        .transpose()?
+        .map(|entry| crate::ssr::bundle(root, &entry, true))
+        .transpose()?;
     let dist_dir = root.join("dist");
     let assets_dir = dist_dir.join("assets");
-    let _ = std::fs::remove_dir_all(&dist_dir); // clean old build
-    std::fs::create_dir_all(&assets_dir)
+    let _ = fs::remove_dir_all(&dist_dir);
+    fs::create_dir_all(&assets_dir)
         .map_err(|e| format!("failed to create dist/assets directory: {e}"))?;
 
-    let metadata = bundle(root, &entry_file, &assets_dir)?;
-    let (built_js, entry_output) = metadata.outputs.iter()
-        .find(|(file, output)| file.ends_with(".js") && output.entry_point.is_some())
-        .ok_or_else(|| "no JavaScript bundle was generated by esbuild".to_string())?;
+    let metadata = bundle(root, &entries, &assets_dir)?;
+    let outputs: HashMap<_, _> = metadata
+        .outputs
+        .iter()
+        .filter_map(|(file, output)| {
+            if !file.ends_with(".js") {
+                return None;
+            }
+            let entry = root
+                .join(output.entry_point.as_ref()?)
+                .canonicalize()
+                .ok()?;
+            entries.contains(&entry).then_some((entry, (file, output)))
+        })
+        .collect();
     let dist_url = |file: &str| {
-        root.join(file).strip_prefix(&dist_dir)
+        root.join(file)
+            .strip_prefix(&dist_dir)
             .map(|path| format!("./{}", path.to_string_lossy().replace('\\', "/")))
             .map_err(|_| format!("esbuild output outside dist: {file}"))
     };
-    let js_url = dist_url(built_js)?;
-    let mut built_files = Vec::new();
-
-    if let Ok(entries) = std::fs::read_dir(&assets_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(meta) = path.metadata() {
-                let fname = path.file_name().unwrap().to_string_lossy().to_string();
-                built_files.push((format!("assets/{fname}"), meta.len()));
-            }
-        }
-    }
-
-    // 5. Copy local stylesheets and update dist/index.html
-    let mut rewritten_html = html_content.replace(
-        &format!("src=\"{script_entry}\""),
-        &format!("src=\"{js_url}\""),
-    ).replace(
-        &format!("src='{script_entry}'"),
-        &format!("src='{js_url}'"),
-    );
 
     let postcss = crate::css::configured(root);
-    for css_href in extract_css_links(&html_content) {
-        if !css_href.starts_with("http://") && !css_href.starts_with("https://") && !css_href.starts_with("//") {
-            let clean_css = css_href.trim_start_matches('/');
-            let src_css = root.join(clean_css);
-            if src_css.is_file() {
-                let dest_css = dist_dir.join(clean_css);
-                if let Some(parent) = dest_css.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let written = if postcss || crate::css::is_module(&src_css) {
-                    let style = crate::css::process(root, &src_css, true)?;
-                    std::fs::write(&dest_css, style.css)
-                } else {
-                    std::fs::copy(&src_css, &dest_css).map(|_| ())
-                };
-                written.map_err(|e| format!("failed to write {}: {e}", dest_css.display()))?;
-                if let Ok(meta) = dest_css.metadata() {
-                    built_files.push((clean_css.to_string(), meta.len()));
-                }
-                rewritten_html = rewritten_html.replace(
-                    &format!("href=\"{css_href}\""),
-                    &format!("href=\"./{clean_css}\""),
-                ).replace(
-                    &format!("href='{css_href}'"),
-                    &format!("href='./{clean_css}'"),
+    let mut manifest = BTreeMap::new();
+    for (page, html, script) in pages {
+        let links = extract_css_links(&html);
+        let mut rewritten = html;
+        let mut css_urls = Vec::new();
+        for href in links {
+            if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("//")
+            {
+                continue;
+            }
+            let clean = href.trim_start_matches('/');
+            let src = root.join(clean);
+            if !src.is_file() {
+                continue;
+            }
+            let dest = dist_dir.join(clean);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+            }
+            let written = if postcss || crate::css::is_module(&src) {
+                let style = crate::css::process(root, &src, true)?;
+                fs::write(&dest, style.css)
+            } else {
+                fs::copy(&src, &dest).map(|_| ())
+            };
+            written.map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
+            let url = format!("./{clean}");
+            rewritten = rewrite_attr(&rewritten, "href", &href, &url);
+            css_urls.push(url);
+        }
+        if let Some((src, entry)) = script {
+            let (js, output) = outputs.get(&entry).ok_or_else(|| {
+                format!("no JavaScript bundle was generated for {}", entry.display())
+            })?;
+            let script = dist_url(js)?;
+            rewritten = rewrite_attr(&rewritten, "src", &src, &script);
+            if let Some(css) = &output.css_bundle {
+                let url = dist_url(css)?;
+                let link = format!("<link rel=\"stylesheet\" href=\"{url}\">\n");
+                let end = rewritten.find("</head>").unwrap_or(0);
+                rewritten.insert_str(end, &link);
+                css_urls.push(url);
+            }
+            if server_bundle.is_some() {
+                manifest.insert(
+                    page.file_name().unwrap().to_string_lossy().into_owned(),
+                    ClientAssets {
+                        script,
+                        css: css_urls,
+                    },
                 );
             }
         }
+        let dest = dist_dir.join(page.file_name().unwrap());
+        fs::write(&dest, rewritten)
+            .map_err(|e| format!("failed to write {}: {e}", dest.display()))?;
     }
 
-    if let Some(css_bundle) = &entry_output.css_bundle {
-        let link = format!("<link rel=\"stylesheet\" href=\"{}\">\n", dist_url(css_bundle)?);
-        if let Some(end) = rewritten_html.find("</head>") {
-            rewritten_html.insert_str(end, &link);
-        } else {
-            rewritten_html.insert_str(0, &link);
-        }
+    if let Some(bundle) = server_bundle {
+        let server_dir = dist_dir.join("server");
+        let manifest = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| format!("failed to serialize SSR client manifest: {e}"))?;
+        fs::create_dir_all(&server_dir)
+            .and_then(|()| fs::write(server_dir.join("entry.mjs"), bundle))
+            .and_then(|()| fs::write(dist_dir.join("ssr-manifest.json"), manifest))
+            .map_err(|e| format!("failed to write SSR output: {e}"))?;
     }
 
-    let dist_index = dist_dir.join("index.html");
-    std::fs::write(&dist_index, &rewritten_html)
-        .map_err(|e| format!("failed to write dist/index.html: {e}"))?;
-    if let Ok(meta) = dist_index.metadata() {
-        built_files.push(("index.html".to_string(), meta.len()));
-    }
-
-    // 6. Copy public directory if present
     let public_dir = root.join("public");
     if public_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&public_dir) {
+        if let Ok(entries) = fs::read_dir(&public_dir) {
             for entry in entries.flatten() {
                 let src_path = entry.path();
                 if src_path.is_file() {
-                    let fname = src_path.file_name().unwrap();
-                    let dest_path = dist_dir.join(fname);
-                    let _ = std::fs::copy(&src_path, &dest_path);
-                    if let Ok(meta) = dest_path.metadata() {
-                        built_files.push((fname.to_string_lossy().to_string(), meta.len()));
+                    let dest_path = dist_dir.join(entry.file_name());
+                    if !dest_path.exists() {
+                        let _ = fs::copy(&src_path, &dest_path);
                     }
                 }
             }
         }
     }
 
-    // 7. Output build summary
+    print_build_summary(root, &dist_dir, start)
+}
+
+pub(crate) fn print_build_summary(root: &Path, dist: &Path, start: Instant) -> Result<(), String> {
+    let mut sizes = Vec::new();
+    collect_sizes(dist, &mut sizes).map_err(|e| format!("failed to measure output files: {e}"))?;
+    sizes.sort_unstable();
     let elapsed = start.elapsed().as_millis();
     println!();
     crate::log::ok(&format!("✓ built in {}ms into dist/", elapsed));
     println!();
-    for (name, size) in built_files {
-        let size_kb = size as f64 / 1024.0;
-        println!("  {}dist/{:<28}{} {:>7.2} kB", crate::log::GRAY, name, crate::log::RESET, size_kb);
+    println!("  {:<36} {:>12} {:>12}", "Output", "Raw", "Gzip");
+    for (path, raw, gzip) in sizes {
+        let name = path
+            .strip_prefix(root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        println!(
+            "  {}{name:<36}{} {:>8.2} KiB {:>8.2} KiB",
+            crate::log::GRAY,
+            crate::log::RESET,
+            raw as f64 / 1024.0,
+            gzip as f64 / 1024.0,
+        );
     }
     println!();
 
+    Ok(())
+}
+
+fn rewrite_attr(html: &str, attr: &str, original: &str, replacement: &str) -> String {
+    html.replace(
+        &format!("{attr}=\"{original}\""),
+        &format!("{attr}=\"{replacement}\""),
+    )
+    .replace(
+        &format!("{attr}='{original}'"),
+        &format!("{attr}='{replacement}'"),
+    )
+}
+
+fn collect_sizes(dir: &Path, sizes: &mut Vec<(PathBuf, u64, u64)>) -> io::Result<()> {
+    for item in fs::read_dir(dir)? {
+        let item = item?;
+        let kind = item.file_type()?;
+        if kind.is_dir() {
+            collect_sizes(&item.path(), sizes)?;
+        } else if kind.is_file() {
+            let file = fs::File::open(item.path())?;
+            let raw = file.metadata()?.len();
+            let mut encoder = GzEncoder::new(file, Compression::default());
+            let gzip = io::copy(&mut encoder, &mut io::sink())?;
+            sizes.push((item.path(), raw, gzip));
+        }
+    }
     Ok(())
 }
 
@@ -284,12 +395,18 @@ mod tests {
     #[test]
     fn test_run_build_errors() {
         let dir = TempDir::new();
-        assert!(run_build(dir.path()).unwrap_err().contains("index.html not found"));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("index.html not found"));
 
         dir.write("index.html", "<html><body></body></html>");
-        assert!(run_build(dir.path()).unwrap_err().contains("<script type=\"module\""));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("<script type=\"module\""));
 
         dir.write("index.html", r#"<script type="module" src="/missing.js"></script>"#);
-        assert!(run_build(dir.path()).unwrap_err().contains("entry script file not found"));
+        assert!(run_build(dir.path(), None)
+            .unwrap_err()
+            .contains("entry script file not found"));
     }
 }

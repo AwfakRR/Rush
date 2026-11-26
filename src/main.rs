@@ -15,6 +15,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -28,7 +29,11 @@ mod log;
 mod env;
 mod alias;
 mod build;
+mod lib_build;
 mod css;
+mod framework;
+mod plugins;
+mod ssr;
 #[cfg(test)]
 mod test_util;
 
@@ -43,6 +48,9 @@ struct AppState {
     proxies: Arc<Vec<(String, String)>>,
     aliases: Arc<Vec<(String, String)>>,
     styles: Arc<css::StyleCache>,
+    solid: bool,
+    plugins: Option<Arc<plugins::DevPlugins>>,
+    ssr_version: Arc<AtomicU64>,
 }
 
 type Diagnostics = Arc<RwLock<HashMap<String, String>>>;
@@ -136,12 +144,16 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
       console.log('[rush] hot update:', msg.path);
       const changed = msg.changed ?? msg.path;
       const ctx = window.__rush_hot?.get(msg.path);
+      if (!ctx && !errors.has(changed)) return;
       const previousUrl = ctx?._refreshUrl;
-      if (ctx?._disposeCallbacks) {
-        for (const cb of ctx._disposeCallbacks) {
-          try { cb(ctx.data); } catch (e) { console.error(e); }
-        }
+      const { _acceptCallbacks: accept = [], _disposeCallbacks: dispose = [] } = ctx ?? {};
+      const styleRevision = ctx?.data.rushStyleRevision;
+      if (ctx) {
+        ctx._acceptCallbacks = [];
         ctx._disposeCallbacks = [];
+      }
+      for (const cb of dispose) {
+        try { cb(ctx.data); } catch (e) { console.error(e); }
       }
       const nextUrl = `${msg.path}?t=${msg.timestamp}`;
       import(nextUrl).then(async newMod => {
@@ -158,13 +170,20 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
           clearTimeout(refreshTimer);
           refreshTimer = setTimeout(() => refresh.performReactRefresh(), 16);
         }
-        if (ctx?._acceptCallbacks) {
-          for (const cb of ctx._acceptCallbacks) {
+        if (styleRevision && styleRevision === ctx.data.rushStyleRevision) {
+          ctx._acceptCallbacks = accept;
+        } else {
+          for (const cb of accept) {
             try { cb(newMod); } catch (e) { console.error(e); }
           }
         }
         if (errors.delete(changed)) updateOverlay();
       }).catch(err => {
+        if (ctx) {
+          ctx._acceptCallbacks = accept;
+          ctx._disposeCallbacks = dispose;
+          ctx._refreshUrl = previousUrl;
+        }
         console.error('[rush] hot update failed:', err);
         if (!errors.has(changed)) errors.set(changed, `${changed}\n\n${err}`);
         updateOverlay();
@@ -201,6 +220,13 @@ window.$RefreshSig$ = () => type => type;
 
 async fn hmr_client() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript")], HMR_CLIENT)
+}
+
+async fn ssr_version_handler(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        state.ssr_version.load(Ordering::Relaxed).to_string(),
+    )
 }
 
 async fn react_refresh_runtime() -> impl IntoResponse {
@@ -327,12 +353,65 @@ if (!link) {{
     ], body).into_response())
 }
 
+fn register_module(
+    state: &AppState,
+    code: &str,
+    filename: &str,
+    path: &str,
+    is_accepting: bool,
+) -> String {
+    let imports = resolve::scan_module_imports(code, filename, state.plugins.is_some());
+    let deps: Vec<_> = imports
+        .iter()
+        .filter_map(|(specifier, _, _)| hmr::local_import_path(path, plugins::clean_id(specifier)))
+        .collect();
+    let mut graph = state.graph.write().unwrap();
+    graph.update(path, &deps, is_accepting);
+    resolve::rewrite_imports(code, imports, |specifier| {
+        let dependency = hmr::local_import_path(path, plugins::clean_id(specifier))?;
+        graph.updated_import(specifier, &dependency)
+    })
+}
+
+async fn prepare_module(
+    state: &AppState,
+    code: &str,
+    filename: &str,
+    target: &Path,
+    path: &str,
+    is_accepting: bool,
+) -> Result<String, String> {
+    let aliased = alias::resolve_aliases(code, filename, &state.aliases);
+    let rewritten = plugins::rewrite_imports(state, &aliased, filename, target).await?;
+    Ok(register_module(
+        state,
+        &rewritten,
+        filename,
+        path,
+        is_accepting,
+    ))
+}
+
 async fn request_middleware(
     State(state): State<AppState>,
     req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path();
+
+    if let Some(plugins) = &state.plugins {
+        if plugins.middleware {
+            let headers = req.headers().iter().filter_map(|(name, value)| {
+                Some((name.as_str(), value.to_str().ok()?))
+            }).collect();
+            let url = req.uri().path_and_query().map_or(path, |value| value.as_str());
+            match plugins.middleware(url, req.method().as_str(), headers).await {
+                Ok(Some(output)) => return plugins::middleware_response(output),
+                Ok(None) => {}
+                Err(error) => return plugins::error_response(error),
+            }
+        }
+    }
 
     // Phase 10: Proxy forwarding — check before any file resolution
     // ponytail: simple prefix match + reqwest forward, no streaming, no websocket proxy
@@ -350,8 +429,15 @@ async fn request_middleware(
                 Ok(resp) => {
                     let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
                         .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+                    let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
                     let body = resp.bytes().await.unwrap_or_default();
-                    return (status, body).into_response();
+                    let mut response = (status, body).into_response();
+                    if let Some(content_type) = content_type {
+                        response
+                            .headers_mut()
+                            .insert(header::CONTENT_TYPE, content_type);
+                    }
+                    return response;
                 }
                 Err(e) => {
                     log::error(&format!("proxy error: {e}"));
@@ -377,6 +463,16 @@ async fn request_middleware(
     };
 
     let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if let Some(plugins) = state.plugins.as_ref().filter(|_| {
+        req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD
+    }) {
+        match plugins::serve_module(&state, plugins, req.uri(), req.headers(), &target, ext).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return plugins::error_response(error),
+        }
+    }
 
     if ext == "css" && target.is_file()
         && Path::new(rel_path).components().all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -433,27 +529,42 @@ async fn request_middleware(
         }
     }
 
-    // Helper to register module dependencies into ModuleGraph
-    let prepare_module = |code: &str, fname: &str, is_accepting| {
-        let mod_path = hmr::normalize_path(rel_path);
-        let aliased = alias::resolve_aliases(code, fname, &state.aliases);
-        let imports = resolve::scan_imports(&aliased, fname);
-        let deps: Vec<_> = imports
-            .iter()
-            .filter_map(|(spec, _, _)| hmr::local_import_path(&mod_path, spec))
-            .collect();
-        let mut graph = state.graph.write().unwrap();
-        graph.update(&mod_path, &deps, is_accepting);
-        let rewritten = resolve::rewrite_imports(&aliased, imports, |specifier| {
-            if resolve::is_bare(specifier) {
-                Some(resolve::dep_url("/node_modules/.rush/deps", specifier))
-            } else {
-                let path = hmr::local_import_path(&mod_path, specifier)?;
-                graph.updated_import(specifier, &path)
+    let mod_path = hmr::normalize_path(rel_path);
+    if framework::handles(ext, state.solid) && target.is_file() {
+        let root = state.root.clone();
+        let component_path = target.clone();
+        let result = tokio::task::spawn_blocking(move || framework::compile(&root, &target)).await;
+        let result = result.map_err(|error| error.to_string()).and_then(|result| result);
+        return match result {
+            Ok(component) => {
+                let fname = "component.js";
+                let rewritten = match prepare_module(
+                    &state,
+                    &component.code,
+                    fname,
+                    &component_path,
+                    &mod_path,
+                    hmr::has_hot_accept(&component.code),
+                )
+                .await
+                {
+                    Ok(code) => code,
+                    Err(error) => return plugins::error_response(error),
+                };
+                let code = hmr::inject_hot_preamble(&rewritten, rel_path);
+                let code = env::replace_env_vars(&code, &state.env_vars);
+                ([(header::CONTENT_TYPE, "application/javascript")], code).into_response()
             }
-        });
-        (rewritten, mod_path)
-    };
+            Err(error) => {
+                log::error(&format!("{rel_path}: {error}"));
+                let message = serde_json::json!({
+                    "type": "error", "path": mod_path, "file": rel_path, "message": error,
+                });
+                state.tx.send(message.to_string()).ok();
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
+            }
+        };
+    }
 
     // TS/TSX/JSX: transpile on the fly via oxc
     // ponytail: no caching of transpile results — files are small, oxc is microseconds.
@@ -464,11 +575,19 @@ async fn request_middleware(
             match transform::transpile(&fname, &source) {
                 Ok(transformed) => {
                     let explicit = hmr::has_hot_accept(&source);
-                    let (mut rewritten, mod_path) = prepare_module(
+                    let mut rewritten = match prepare_module(
+                        &state,
                         &transformed.code,
                         &fname,
+                        &target,
+                        &mod_path,
                         explicit || transformed.refresh_registration,
-                    );
+                    )
+                    .await
+                    {
+                        Ok(code) => code,
+                        Err(error) => return plugins::error_response(error),
+                    };
                     if transformed.refresh_registration || transformed.refresh_signature {
                         rewritten = hmr::inject_refresh_preamble(
                             &rewritten,
@@ -496,11 +615,22 @@ async fn request_middleware(
     }
 
     // JS: rewrite bare imports for browser execution
-    if target.is_file() && ext == "js" {
+    if target.is_file() && (ext == "js" || state.plugins.is_some() && ext == "mjs") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
-            let (rewritten, mod_path) =
-                prepare_module(&source, &fname, hmr::has_hot_accept(&source));
+            let rewritten = match prepare_module(
+                &state,
+                &source,
+                &fname,
+                &target,
+                &mod_path,
+                hmr::has_hot_accept(&source),
+            )
+            .await
+            {
+                Ok(code) => code,
+                Err(error) => return plugins::error_response(error),
+            };
             let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
             // Phase 9: Replace import.meta.env.* references
             let final_code = env::replace_env_vars(&with_hmr, &state.env_vars);
@@ -547,6 +677,10 @@ struct CliArgs {
     proxies: Vec<(String, String)>,
     https: bool,
     build: bool,
+    lib: bool,
+    entry: Option<PathBuf>,
+    ssr: Option<PathBuf>,
+    ssr_transform: Option<PathBuf>,
 }
 
 fn parse_args() -> CliArgs {
@@ -558,6 +692,10 @@ fn parse_args() -> CliArgs {
         proxies: Vec::new(),
         https: false,
         build: false,
+        lib: false,
+        entry: None,
+        ssr: None,
+        ssr_transform: None,
     };
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -565,6 +703,32 @@ fn parse_args() -> CliArgs {
         match args[i].as_str() {
             "build" | "--build" => {
                 args_out.build = true;
+            }
+            "ssr-transform" => {
+                i += 1;
+                if let Some(path) = args.get(i).filter(|path| !path.starts_with('-')) {
+                    args_out.ssr_transform = Some(PathBuf::from(path));
+                } else {
+                    log::error("ssr-transform requires an entry path");
+                    std::process::exit(1);
+                }
+            }
+            "--lib" => {
+                args_out.lib = true;
+            }
+            "--entry" | "--ssr" => {
+                let flag = &args[i];
+                i += 1;
+                if let Some(path) = args.get(i).filter(|path| !path.starts_with('-')) {
+                    if flag == "--ssr" {
+                        args_out.ssr = Some(PathBuf::from(path));
+                    } else {
+                        args_out.entry = Some(PathBuf::from(path));
+                    }
+                } else {
+                    log::error(&format!("{flag} requires a path"));
+                    std::process::exit(1);
+                }
             }
             "--port" | "-p" if i + 1 < args.len() => {
                 args_out.port = args[i + 1].parse().unwrap_or(3000);
@@ -590,11 +754,21 @@ fn parse_args() -> CliArgs {
             }
             "--help" | "-h" => {
                 println!("Usage: rush [build] [--port <port>] [--root <dir>] [--open] [--https] [--proxy <prefix>=<target>]");
+                println!("       rush build --lib [--entry <path>] [--root <dir>]");
+                println!("       rush build --ssr <entry> [--root <dir>]");
                 std::process::exit(0);
             }
             _ => {}
         }
         i += 1;
+    }
+    if (args_out.lib && !args_out.build) || (args_out.entry.is_some() && !args_out.lib) {
+        log::error("--lib requires build, and --entry requires build --lib");
+        std::process::exit(1);
+    }
+    if args_out.ssr.is_some() && (!args_out.build || args_out.lib) {
+        log::error("--ssr requires an app build and cannot be combined with --lib");
+        std::process::exit(1);
     }
     args_out
 }
@@ -645,17 +819,42 @@ async fn main() {
         }
     };
 
+    if let Some(entry) = &cli.ssr_transform {
+        match ssr::resolve_entry(&root, entry).and_then(|file| ssr::bundle(&root, &file, false)) {
+            Ok(code) => print!("{code}"),
+            Err(error) => {
+                log::error(&error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // Phase 16: Production Build command
     if cli.build {
-        if let Err(e) = build::run_build(&root) {
+        let result = if cli.lib {
+            lib_build::run_lib_build(&root, cli.entry.as_deref())
+        } else {
+            build::run_build(&root, cli.ssr.as_deref())
+        };
+        if let Err(e) = result {
             log::error(&format!("build failed: {e}"));
             std::process::exit(1);
         }
         return;
     }
 
+    let plugins = match plugins::DevPlugins::start(&root, cli.port, cli.https) {
+        Ok(plugins) => plugins,
+        Err(error) => {
+            log::error(&format!("could not load plugins: {error}"));
+            std::process::exit(1);
+        }
+    };
+
     // Phase 3: Pre-bundle node_modules dependencies via esbuild
-    if let Err(e) = resolve::prebundle(&root) {
+    let solid = framework::solid(&root);
+    if let Err(e) = framework::prebundle(&root, solid) {
         log::warn(&format!("prebundle notice: {e}"));
     }
 
@@ -663,6 +862,12 @@ async fn main() {
     let diagnostics = Diagnostics::default();
     let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
     let styles = Arc::new(css::StyleCache::default());
+    let ssr_version = Arc::new(AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    ));
 
     // Spawn debounced file watcher in background thread
     let watcher_root = root.clone();
@@ -670,6 +875,7 @@ async fn main() {
     let watcher_graph = graph.clone();
     let watcher_diagnostics = diagnostics.clone();
     let watcher_styles = styles.clone();
+    let watcher_ssr_version = ssr_version.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(50));
@@ -693,6 +899,7 @@ async fn main() {
                 if events.is_empty() {
                     continue;
                 }
+                watcher_ssr_version.fetch_add(1, Ordering::Relaxed);
                 let has_postcss = css::configured(&watcher_root);
                 let postcss_affected = has_postcss || had_postcss;
                 had_postcss = has_postcss;
@@ -732,9 +939,9 @@ async fn main() {
                             "timestamp": now,
                         });
                         watcher_tx.send(msg.to_string()).ok();
-                    } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
+                    } else if matches!(ext, "js" | "mjs" | "ts" | "mts" | "jsx" | "tsx" | "vue" | "svelte") {
                         let changed = hmr::normalize_path(&rel);
-                        if matches!(ext, "ts" | "jsx" | "tsx") {
+                        if matches!(ext, "ts" | "mts" | "jsx" | "tsx") {
                             if let Ok(source) = std::fs::read_to_string(&event.path) {
                                 if let Err(error) = transform::check_syntax(&rel, &source) {
                                     publish_transpile_error(
@@ -812,11 +1019,15 @@ async fn main() {
         proxies,
         aliases,
         styles,
+        solid,
+        plugins,
+        ssr_version,
     };
 
     let app = Router::new()
         .route("/__hmr", get(ws_handler))
         .route("/__hmr.js", get(hmr_client))
+        .route("/__rush/ssr-version", get(ssr_version_handler))
         .route("/@react-refresh", get(react_refresh_runtime))
         .fallback_service(ServeDir::new(&state.root))
         .layer(from_fn_with_state(state.clone(), request_middleware))

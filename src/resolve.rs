@@ -1,6 +1,10 @@
 use oxc::{
     allocator::Allocator,
-    ast::ast::ModuleDeclaration,
+    ast::ast::{
+        ExportAllDeclaration, ExportFromDeclaration, Expression, ImportDeclaration,
+        ImportExpression, StringLiteral,
+    },
+    ast_visit::{walk, Visit},
     parser::Parser,
     span::SourceType,
 };
@@ -9,17 +13,15 @@ use std::collections::{hash_map::DefaultHasher, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-/// Check if an import specifier is a bare package name (not relative, absolute, or external URL).
+/// Check if an import specifier is a bare package name (not a path or URL-like ID).
 pub fn is_bare(spec: &str) -> bool {
-    // ponytail: 4 simple checks, no url crate, no regex
     !spec.starts_with('.')
         && !spec.starts_with('/')
-        && !spec.starts_with("http://")
-        && !spec.starts_with("https://")
+        && !spec.split('/').next().unwrap_or_default().contains(':')
 }
 
 /// URL path where pre-bundled dependency is served.
-pub fn dep_url(deps_dir: &str, specifier: &str) -> String {
+pub(crate) fn dep_url(deps_dir: &str, specifier: &str) -> String {
     // ponytail: slashes in scoped packages (@foo/bar) become double underscores
     format!("{}/{}.js", deps_dir.trim_end_matches('/'), specifier.replace('/', "__"))
 }
@@ -27,33 +29,58 @@ pub fn dep_url(deps_dir: &str, specifier: &str) -> String {
 /// Scan JS/TS source code for import and export specifiers.
 /// Returns Vec<(specifier_string, span_start, span_end)>.
 pub fn scan_imports(source: &str, filename: &str) -> Vec<(String, u32, u32)> {
+    scan_module_imports(source, filename, false)
+}
+
+pub(crate) fn scan_module_imports(source: &str, filename: &str, extended: bool) -> Vec<(String, u32, u32)> {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(Path::new(filename)).unwrap_or_default();
     let parser_ret = Parser::new(&allocator, source, source_type).parse();
-    let mut imports = Vec::new();
+    struct Imports {
+        spans: Vec<(String, u32, u32)>,
+        extended: bool,
+    }
 
-    // ponytail: walk top-level statements, no full AST visitor pass needed
-    for stmt in &parser_ret.program.body {
-        if let Some(decl) = stmt.as_module_declaration() {
-            match decl {
-                ModuleDeclaration::ImportDeclaration(import_decl) => {
-                    let spec = import_decl.source.value.to_string();
-                    imports.push((spec, import_decl.source.span.start, import_decl.source.span.end));
-                }
-                ModuleDeclaration::ExportAllDeclaration(export_decl) => {
-                    let spec = export_decl.source.value.to_string();
-                    imports.push((spec, export_decl.source.span.start, export_decl.source.span.end));
-                }
-                ModuleDeclaration::ExportFromDeclaration(export_decl) => {
-                    let source = &export_decl.source;
-                    imports.push((source.value.to_string(), source.span.start, source.span.end));
-                }
-                _ => {}
-            }
+    impl Imports {
+        fn add(&mut self, source: &StringLiteral<'_>) {
+            self.spans.push((source.value.to_string(), source.span.start, source.span.end));
         }
     }
 
-    imports
+    impl<'a> Visit<'a> for Imports {
+        fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
+            self.add(&import.source);
+        }
+
+        fn visit_export_all_declaration(&mut self, export: &ExportAllDeclaration<'a>) {
+            self.add(&export.source);
+        }
+
+        fn visit_export_from_declaration(&mut self, export: &ExportFromDeclaration<'a>) {
+            self.add(&export.source);
+        }
+
+        fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
+            if !self.extended {
+                return;
+            }
+            if let Expression::StringLiteral(source) = &import.source {
+                self.add(source);
+            }
+            walk::walk_import_expression(self, import);
+        }
+    }
+
+    let mut imports = Imports { spans: Vec::new(), extended };
+    if extended {
+        imports.visit_program(&parser_ret.program);
+        imports.spans.sort_by_key(|(_, start, _)| *start);
+    } else {
+        for statement in &parser_ret.program.body {
+            imports.visit_statement(statement);
+        }
+    }
+    imports.spans
 }
 
 /// Rewrite import specifiers using previously scanned spans.
@@ -77,8 +104,7 @@ pub fn rewrite_imports(
     result
 }
 
-#[cfg(test)]
-fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> String {
+pub fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> String {
     rewrite_imports(source, scan_imports(source, filename), |specifier| {
         is_bare(specifier).then(|| dep_url(deps_dir, specifier))
     })
@@ -89,6 +115,15 @@ fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> String 
 /// Handles exports.".".import, exports.".".default, module, main, index.js.
 #[allow(dead_code)]
 pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf> {
+    let slash_count = if package_name.starts_with('@') { 2 } else { 1 };
+    let subpath = package_name.match_indices('/').nth(slash_count - 1);
+    let (package_name, export_key) = match subpath {
+        Some((index, _)) => (
+            &package_name[..index],
+            format!(".{}", &package_name[index..]),
+        ),
+        None => (package_name, ".".to_string()),
+    };
     let pkg_dir = root.join("node_modules").join(package_name);
     let pkg_json_path = pkg_dir.join("package.json");
     let Ok(raw) = std::fs::read_to_string(&pkg_json_path) else {
@@ -99,19 +134,24 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
 
     // 1. Check "exports" field
     if let Some(exports) = pkg.get("exports") {
-        if let Some(dot) = exports.get(".") {
+        if let Some(entry) = exports.get(&export_key) {
             for key in ["import", "default", "browser"] {
-                if let Some(p) = dot.get(key).and_then(|v| v.as_str()) {
+                if let Some(p) = entry.get(key).and_then(|v| v.as_str()) {
                     return Some(pkg_dir.join(p));
                 }
             }
-            if let Some(p) = dot.as_str() {
+            if let Some(p) = entry.as_str() {
                 return Some(pkg_dir.join(p));
             }
         }
-        if let Some(p) = exports.as_str() {
-            return Some(pkg_dir.join(p));
+        if export_key == "." {
+            if let Some(p) = exports.as_str() {
+                return Some(pkg_dir.join(p));
+            }
         }
+    }
+    if export_key != "." {
+        return None;
     }
 
     // 2. Check "module" field (standard for modern ESM builds)
@@ -156,6 +196,10 @@ pub fn lockfile_hash(root: &Path) -> String {
 /// Scan a directory recursively for bare imports across all source files.
 /// ponytail: simple std::fs::read_dir recursion, skips noise dirs without heavy walkdir/glob crates.
 pub fn scan_dir_for_bare_imports(root: &Path, dir: &Path, bare: &mut HashSet<String>) {
+    scan_bare_imports(root, dir, bare, crate::plugins::find_config(root).is_some());
+}
+
+fn scan_bare_imports(root: &Path, dir: &Path, bare: &mut HashSet<String>, extended: bool) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -168,13 +212,13 @@ pub fn scan_dir_for_bare_imports(root: &Path, dir: &Path, bare: &mut HashSet<Str
             if name == "node_modules" || name == ".git" || name == "target" || name.starts_with('.') {
                 continue;
             }
-            scan_dir_for_bare_imports(root, &path, bare);
-        } else if path.is_file() {
+            scan_bare_imports(root, &path, bare, extended);
+        } else if path.is_file() && !(dir == root && crate::plugins::is_config(&path)) {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
             if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
                 if let Ok(source) = std::fs::read_to_string(&path) {
                     let fname = path.file_name().unwrap().to_string_lossy().to_string();
-                    for (spec, _, _) in scan_imports(&source, &fname) {
+                    for (spec, _, _) in scan_module_imports(&source, &fname, extended) {
                         if is_bare(&spec) {
                             bare.insert(spec);
                         }
@@ -233,9 +277,10 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
 
     // 3. Resolve entry points in node_modules
     let mut entries = Vec::new();
+    let allow_auto_install = crate::plugins::find_config(root).is_none();
     for pkg in &bare_set {
         let mut entry_opt = resolve_package_entry(root, pkg);
-        if entry_opt.is_none() && root.join("package.json").exists() {
+        if entry_opt.is_none() && allow_auto_install && root.join("package.json").exists() {
             // Phase 14: Auto-install missing dependency if package.json exists in root
             if let Ok(()) = auto_install_package(root, pkg) {
                 entry_opt = resolve_package_entry(root, pkg);
@@ -491,6 +536,26 @@ export * from 'lodash-es';"#;
         assert_eq!(entry("module-field"), Some(Path::new("module-field/./m.js").to_path_buf()));
         assert_eq!(entry("main-field"), Some(Path::new("main-field/./main.js").to_path_buf()));
         assert_eq!(entry("@scope/pkg"), Some(Path::new("@scope/pkg/./scoped.js").to_path_buf()));
+    }
+
+    #[test]
+    fn test_resolve_package_export_subpaths() {
+        let dir = TempDir::new();
+        for name in ["react-dom", "@scope/pkg"] {
+            pkg(
+                &dir,
+                name,
+                r#"{"main":"./main.js","exports":{"./client":"./client.js"}}"#,
+            );
+            assert_eq!(
+                resolve_package_entry(dir.path(), &format!("{name}/client")),
+                Some(dir.path().join("node_modules").join(name).join("client.js")),
+            );
+            assert_eq!(
+                resolve_package_entry(dir.path(), &format!("{name}/private")),
+                None
+            );
+        }
     }
 
     #[test]

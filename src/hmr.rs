@@ -109,9 +109,12 @@ impl ModuleGraph {
     }
 
     pub fn updated_import(&self, specifier: &str, path: &str) -> Option<String> {
-        self.versions
-            .get(path)
-            .map(|version| format!("{specifier}?t={version}"))
+        let version = self.versions.get(path)?;
+        let (url, fragment) = specifier
+            .split_once('#')
+            .map_or((specifier, ""), |(url, _)| (url, &specifier[url.len()..]));
+        let separator = if url.contains('?') { '&' } else { '?' };
+        Some(format!("{url}{separator}t={version}{fragment}"))
     }
 }
 
@@ -248,6 +251,10 @@ mod tests {
         assert_eq!(
             graph.updated_import("./utils.ts", "/utils.ts").as_deref(),
             Some("./utils.ts?t=42")
+        );
+        assert_eq!(
+            graph.updated_import("./utils.ts?raw#module", "/utils.ts").as_deref(),
+            Some("./utils.ts?raw&t=42#module")
         );
         assert_eq!(graph.invalidate("/orphan.ts", 43), None);
         assert_eq!(graph.updated_import("./orphan.ts", "/orphan.ts"), None);
