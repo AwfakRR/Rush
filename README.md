@@ -86,7 +86,21 @@ cargo build --release
 ```bash
 # Bundle, minify, hash assets, and output to dist/
 rush build --root ./example
+# Serve only the production output
+python3 -m http.server 8080 --directory ./example/dist
 ```
+
+Rush builds every `.html` file directly in the project root and keeps its filename in `dist/`.
+For each page, it bundles the first local `<script type="module" src="...">` and rewrites the
+page to reference its hashed bundle. Pages without a module script are copied with their
+linked stylesheets; at least one page must have a module entry. Use links such as
+`./about.html` to navigate between built pages.
+
+Dynamic `import()` loads separately hashed JavaScript chunks on demand, and modules used
+by multiple entries can be shared between pages. The build report lists the raw and
+gzip-compressed size of each output file in KiB; it does not write `.gz` files.
+In the example, click **Load lazy chunk** to see the filename loaded by the browser, or
+follow **About this build** to open the second page and its own JavaScript entry.
 
 ### HTTPS Example
 

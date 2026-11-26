@@ -68,18 +68,20 @@ async function processor(configured) {
   };
 }
 
-async function build(entry, outdir, configured) {
+async function build(entries, outdir, configured) {
   const esbuild = dependency('esbuild');
   const processCss = await processor(configured);
   const result = await esbuild.build({
-    entryPoints: [entry],
+    entryPoints: entries,
     outdir,
     bundle: true,
+    splitting: true,
     minify: true,
     format: 'esm',
     sourcemap: true,
     target: 'es2020',
     entryNames: '[name]-[hash]',
+    chunkNames: '[name]-[hash]',
     assetNames: '[name]-[hash]',
     metafile: true,
     plugins: [{
@@ -123,9 +125,9 @@ async function build(entry, outdir, configured) {
 }
 
 async function main() {
-  const [action, configured, file, outdir] = process.argv.slice(1);
+  const [action, configured, file, ...entries] = process.argv.slice(1);
   const output = action === 'build'
-    ? await build(file, outdir, configured === 'true')
+    ? await build(entries, file, configured === 'true')
     : await (await processor(configured === 'true'))(file);
   process.stdout.write(JSON.stringify(output));
 }
