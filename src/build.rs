@@ -26,11 +26,17 @@ fn bundle(
     assets: &Path,
 ) -> Result<EsbuildMetadata, String> {
     let configured = crate::css::configured(root);
+    let config = crate::plugins::find_config(root);
     if root.join("node_modules/esbuild/package.json").is_file() {
         let paths: Vec<_> = std::iter::once(assets)
+            .chain(config.iter().map(PathBuf::as_path))
             .chain(entries.iter().map(PathBuf::as_path))
             .collect();
-        return crate::css::run_node(root, "build", configured, true, &paths);
+        let action = if config.is_some() { "plugin-build" } else { "build" };
+        return crate::css::run_node(root, action, configured, true, &paths);
+    }
+    if config.is_some() {
+        return Err("plugin builds require the project's esbuild package. Run npm install -D esbuild.".into());
     }
     if configured {
         return Err(

@@ -31,6 +31,7 @@ mod build;
 mod lib_build;
 mod css;
 mod framework;
+mod plugins;
 #[cfg(test)]
 mod test_util;
 
@@ -45,6 +46,7 @@ struct AppState {
     aliases: Arc<Vec<(String, String)>>,
     styles: Arc<css::StyleCache>,
     solid: bool,
+    plugins: Option<Arc<plugins::DevPlugins>>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
@@ -274,6 +276,20 @@ async fn request_middleware(
 ) -> Response {
     let path = req.uri().path();
 
+    if let Some(plugins) = &state.plugins {
+        if plugins.middleware {
+            let headers = req.headers().iter().filter_map(|(name, value)| {
+                Some((name.as_str(), value.to_str().ok()?))
+            }).collect();
+            let url = req.uri().path_and_query().map_or(path, |value| value.as_str());
+            match plugins.middleware(url, req.method().as_str(), headers).await {
+                Ok(Some(output)) => return plugins::middleware_response(output),
+                Ok(None) => {}
+                Err(error) => return plugins::error_response(error),
+            }
+        }
+    }
+
     // Phase 10: Proxy forwarding — check before any file resolution
     // ponytail: simple prefix match + reqwest forward, no streaming, no websocket proxy
     for (prefix, target_url) in state.proxies.iter() {
@@ -317,6 +333,16 @@ async fn request_middleware(
     };
 
     let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if let Some(plugins) = state.plugins.as_ref().filter(|_| {
+        req.method() == axum::http::Method::GET || req.method() == axum::http::Method::HEAD
+    }) {
+        match plugins::serve_module(&state, plugins, req.uri(), req.headers(), &target, ext).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return plugins::error_response(error),
+        }
+    }
 
     if ext == "css" && target.is_file()
         && Path::new(rel_path).components().all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -393,6 +419,7 @@ async fn request_middleware(
 
     if framework::handles(ext, state.solid) && target.is_file() {
         let root = state.root.clone();
+        let component_path = target.clone();
         let result = tokio::task::spawn_blocking(move || framework::compile(&root, &target)).await;
         let result = result.map_err(|error| error.to_string()).and_then(|result| result);
         return match result {
@@ -400,7 +427,10 @@ async fn request_middleware(
                 let fname = "component.js";
                 register_module(&component.code, fname);
                 let aliased = alias::resolve_aliases(&component.code, fname, &state.aliases);
-                let rewritten = resolve::rewrite_bare_imports(&aliased, fname, "/node_modules/.rush/deps");
+                let rewritten = match plugins::rewrite_imports(&state, &aliased, fname, &component_path).await {
+                    Ok(code) => code,
+                    Err(error) => return plugins::error_response(error),
+                };
                 let code = hmr::inject_hot_preamble(&rewritten, rel_path);
                 let code = env::replace_env_vars(&code, &state.env_vars);
                 ([(header::CONTENT_TYPE, "application/javascript")], code).into_response()
@@ -426,7 +456,10 @@ async fn request_middleware(
                     // Phase 11: Resolve path aliases before bare import rewriting
                     let aliased = alias::resolve_aliases(&code, &fname, &state.aliases);
                     // Phase 2: Rewrite bare imports before serving to browser
-                    let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
+                    let rewritten = match plugins::rewrite_imports(&state, &aliased, &fname, &target).await {
+                        Ok(code) => code,
+                        Err(error) => return plugins::error_response(error),
+                    };
                     // Phase 4: Inject import.meta.hot preamble
                     let mod_path = hmr::normalize_path(rel_path);
                     let mut with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
@@ -462,13 +495,16 @@ async fn request_middleware(
     }
 
     // JS: rewrite bare imports for browser execution
-    if target.is_file() && ext == "js" {
+    if target.is_file() && (ext == "js" || state.plugins.is_some() && ext == "mjs") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
             register_module(&source, &fname);
             // Phase 11: Resolve path aliases before bare import rewriting
             let aliased = alias::resolve_aliases(&source, &fname, &state.aliases);
-            let rewritten = resolve::rewrite_bare_imports(&aliased, &fname, "/node_modules/.rush/deps");
+            let rewritten = match plugins::rewrite_imports(&state, &aliased, &fname, &target).await {
+                Ok(code) => code,
+                Err(error) => return plugins::error_response(error),
+            };
             // Phase 4: Inject import.meta.hot preamble
             let mod_path = hmr::normalize_path(rel_path);
             let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
@@ -650,6 +686,14 @@ async fn main() {
         return;
     }
 
+    let plugins = match plugins::DevPlugins::start(&root, cli.port, cli.https) {
+        Ok(plugins) => plugins,
+        Err(error) => {
+            log::error(&format!("could not load plugins: {error}"));
+            std::process::exit(1);
+        }
+    };
+
     // Phase 3: Pre-bundle node_modules dependencies via esbuild
     let solid = framework::solid(&root);
     if let Err(e) = framework::prebundle(&root, solid) {
@@ -791,6 +835,7 @@ async fn main() {
         aliases,
         styles,
         solid,
+        plugins,
     };
 
     let app = Router::new()

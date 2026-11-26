@@ -200,6 +200,39 @@ The example uses Tailwind v4. Install `tailwindcss` and `@tailwindcss/postcss`, 
 
 Stylesheet edits hot-swap the CSS without losing page state. If a CSS Module's exported classes change, Rush reloads the page so importers receive the new map.
 
+## Vite and Rollup Plugins
+
+Rush can run a subset of Vite and Rollup plugin hooks in dev and in the HTML app build (`rush build`, not `rush build --lib`). Add a config in your project root and install the plugins there:
+
+```bash
+npm install -D esbuild @rollup/plugin-virtual
+```
+
+```js
+// rush.config.mjs
+import virtual from '@rollup/plugin-virtual';
+
+export default {
+  plugins: [
+    virtual({ 'virtual:greeting': 'export default "Hello from Rush";' }),
+  ],
+};
+```
+
+Import the generated module with `import greeting from 'virtual:greeting'`. Rush picks the first config it finds in this order: `rush.config.js`, `rush.config.mjs`, `rush.config.ts`, then the same extensions for `vite.config`. Export an object or a function (sync or async) receiving `{ command, mode }`. `command` is `serve` or `build`; `mode` is `development` or `production`. You don't need Vite unless your config or plugins import it. Rush loads the config with Node.js; use `.mjs` for unambiguous ESM, and Node 22.18+ with erasable TypeScript syntax for `.ts`. Builds using plugins need the project's `esbuild` npm package. Configs and plugins execute as trusted local JavaScript; only run configs and install plugins you trust.
+
+| Hook or API | Rush support |
+| --- | --- |
+| Plugin selection and order | Nested arrays, promises, and falsy entries; Vite's `apply` string or predicate and `enforce: 'pre' / 'post'`; hook functions or `{ handler, order }`. Hook order takes precedence over plugin order. Hook filters and parallel/sequential hints are not implemented. |
+| `config`, `configResolved` | Both modes. Returned config is merged for subsequent hooks. Vite's config fields don't reconfigure Rush (including aliases, root, build options, and server options), and plugins added from a `config` hook aren't loaded. |
+| `resolveId`, `load`, `transform` | Both modes. Supports virtual IDs (including `\0` prefixes), external results, and code hooks returning a string or `{ code, map }`. In dev, Rush resolves static imports, re-exports and string-literal dynamic imports in app modules and serves registered virtual IDs under `/@id/`. Builds don't redirect HTML entry scripts through `resolveId`. Only JavaScript/TypeScript and common text inputs are read from disk for plugin transforms; a plugin can return module code from `load` for other imports. Build passes the final plugin map to esbuild when present; dev does not consume plugin maps, and Rush does not compose maps between plugins. |
+| `buildStart`, `buildEnd` | `buildStart` runs in both modes. `buildEnd` runs after the production bundle, including when esbuild fails. It also runs when the dev sidecar receives EOF, but isn't guaranteed on server termination. |
+| `configureServer` | Dev only. Use `server.middlewares.use([path,] handler)` before Rush routing. Handlers receive `req.url`, `originalUrl`, `method`, `headers`, and a buffered response with `statusCode`, header methods, `writeHead`, `write`, and `end`. Call `next()` to continue. No request body/stream, returned post-hook, real Node HTTP server, Vite WebSocket API, or Vite module graph. |
+| Plugin context | `this.resolve` (with `skipSelf`, true by default), `this.warn`, `this.error`, and `this.meta.watchMode`. Build plugins can emit assets with `emitFile`, `getFileName`, and `setAssetSource`; emitting chunks or using `import.meta.ROLLUP_FILE_URL_*` isn't supported. |
+| Other Vite/Rollup APIs | No `transformIndexHtml`, plugin-specific HMR (`handleHotUpdate`/`hotUpdate`), SSR, output hooks (such as `renderChunk` and `generateBundle`), or full Rollup context (`parse`, `addWatchFile`, `getModuleInfo`, etc.). Rush's built-in HTML, CSS, dependency pre-bundling, and HMR pipelines still apply. Install dependencies explicitly in projects with plugin configs and restart dev after changing the config or plugin code. |
+
+The [example config](example/rush.config.mjs) uses three published Rollup plugins: `@rollup/plugin-virtual` supplies a greeting, `@rollup/plugin-yaml` imports a YAML object, and `@rollup/plugin-replace` inserts the current mode. The example page displays all three results in dev and after a production build.
+
 ## Example Project
 
 The included `example/` folder demonstrates Rush serving HTML, CSS, JavaScript, and TypeScript together:
@@ -257,7 +290,7 @@ Rush is built on **radical pragmatism and first-principles simplicity**: deliver
 ## Testing
 
 ```bash
-npm ci --prefix example   # Node dependencies used by the build, CSS and framework integration tests
+npm ci --prefix example   # Node dependencies used by build, CSS, framework, and plugin integration tests
 cargo test
 ```
 
