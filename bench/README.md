@@ -25,6 +25,9 @@ npm run bench -- --components 250 --runs 10
 To also use the browser benchmark as a regression test, run
 `npm run bench -- --assert-rush-refresh`. It fails if a Rush root or leaf
 edit reloads the page or loses React state in any trial.
+It also checks, outside the timed edits, that a syntax error keeps the app
+mounted behind an overlay, a fix preserves state, and an initially broken
+page mounts after one reload.
 
 The Markdown table goes to stdout; individual samples, summaries, machine
 information, and tool versions go to `bench/results/<timestamp>.json`. The

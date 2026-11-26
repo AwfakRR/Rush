@@ -140,18 +140,15 @@ async fn rewrites_plain_js_and_replaces_env() {
 }
 
 #[tokio::test]
-async fn transpile_error_returns_console_error_module() {
+async fn transpile_error_returns_http_500_with_diagnostic() {
     let f = project();
     let s = Server::start(f.path(), &[]);
 
     let resp = s.get("/broken.ts").await;
-    assert!(resp.status().is_success());
-    assert_eq!(content_type(&resp), JS);
+    assert_eq!(resp.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(content_type(&resp), "text/plain; charset=utf-8");
     let body = resp.text().await.unwrap();
-    assert!(
-        body.starts_with("console.error(`[rush] Parse error in broken.ts"),
-        "{body}"
-    );
+    assert!(body.starts_with("Parse error in broken.ts"), "{body}");
 }
 
 #[tokio::test]

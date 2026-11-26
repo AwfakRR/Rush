@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Request, State,
     },
-    http::header,
+    http::{header, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -35,12 +35,15 @@ mod test_util;
 struct AppState {
     root: PathBuf,
     tx: broadcast::Sender<String>,
+    diagnostics: Diagnostics,
     graph: Arc<RwLock<hmr::ModuleGraph>>,
     source_maps: Arc<RwLock<HashMap<String, String>>>,
     env_vars: Arc<HashMap<String, String>>,
     proxies: Arc<Vec<(String, String)>>,
     aliases: Arc<Vec<(String, String)>>,
 }
+
+type Diagnostics = Arc<RwLock<HashMap<String, String>>>;
 
 const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
 
@@ -58,8 +61,20 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
     }
     el.querySelector('pre').textContent = msg;
   }
-  function clearOverlay() {
-    document.getElementById('__rush_error')?.remove();
+  const errors = new Map();
+  function updateOverlay() {
+    if (errors.size) {
+      showOverlay([...errors.values()].join('\n\n'));
+    } else {
+      document.getElementById('__rush_error')?.remove();
+    }
+  }
+
+  let reloading = false;
+  function reloadOnce() {
+    if (reloading) return;
+    reloading = true;
+    location.reload();
   }
 
   let refreshTimer;
@@ -74,6 +89,7 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
   const socket = new WebSocket(`${proto}//${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
   socket.addEventListener('message', ({ data }) => {
+    if (reloading) return;
     let msg;
     try {
       msg = JSON.parse(data);
@@ -83,9 +99,9 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
 
     if (msg.type === 'error') {
       console.error('[rush]', msg.message);
-      showOverlay(msg.file ? msg.file + '\n\n' + msg.message : msg.message);
+      errors.set(msg.path, msg.file ? msg.file + '\n\n' + msg.message : msg.message);
+      updateOverlay();
     } else if (msg.type === 'css') {
-      clearOverlay();
       console.log('[rush] css update:', msg.path);
       const links = document.querySelectorAll('link[rel="stylesheet"]');
       for (const link of links) {
@@ -94,8 +110,8 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
         link.href = url.href;
       }
     } else if (msg.type === 'js-update') {
-      clearOverlay();
       console.log('[rush] hot update:', msg.path);
+      const changed = msg.changed ?? msg.path;
       const ctx = window.__rush_hot?.get(msg.path);
       const previousUrl = ctx?._refreshUrl;
       if (ctx?._disposeCallbacks) {
@@ -106,10 +122,14 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
       }
       const nextUrl = `${msg.path}?t=${msg.timestamp}`;
       import(nextUrl).then(async newMod => {
+        if (!ctx) {
+          reloadOnce();
+          return;
+        }
         if (previousUrl) {
           if (ctx._refreshUrl !== new URL(nextUrl, location.href).href ||
               !canRefresh(await import(previousUrl), newMod)) {
-            location.reload();
+            reloadOnce();
             return;
           }
           clearTimeout(refreshTimer);
@@ -120,19 +140,20 @@ const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
             try { cb(newMod); } catch (e) { console.error(e); }
           }
         }
+        if (errors.delete(changed)) updateOverlay();
       }).catch(err => {
-        console.error('[rush] hot update failed, reloading:', err);
-        location.reload();
+        console.error('[rush] hot update failed:', err);
+        if (!errors.has(changed)) errors.set(changed, `${changed}\n\n${err}`);
+        updateOverlay();
       });
     } else {
-      clearOverlay();
       console.log('[rush] full reload');
-      location.reload();
+      reloadOnce();
     }
   });
   socket.addEventListener('close', () => {
     console.log('[rush] disconnected, reconnecting...');
-    setTimeout(() => location.reload(), 1500);
+    setTimeout(reloadOnce, 1500);
   });
 })();"#;
 
@@ -167,15 +188,53 @@ async fn react_refresh_runtime() -> impl IntoResponse {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state.tx.subscribe()))
+    ws.on_upgrade(move |socket| async move {
+        let (rx, active) = {
+            let diagnostics = state.diagnostics.read().unwrap();
+            (
+                state.tx.subscribe(),
+                diagnostics.values().cloned().collect(),
+            )
+        };
+        handle_ws(socket, rx, active).await;
+    })
 }
 
-async fn handle_ws(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+async fn handle_ws(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<String>,
+    active: Vec<String>,
+) {
+    for msg in active {
+        if socket.send(Message::Text(msg.into())).await.is_err() {
+            return;
+        }
+    }
     while let Ok(msg) = rx.recv().await {
         if socket.send(Message::Text(msg.into())).await.is_err() {
             break;
         }
     }
+}
+
+fn publish_transpile_error(
+    tx: &broadcast::Sender<String>,
+    diagnostics: &Diagnostics,
+    file: &str,
+    message: &str,
+) {
+    log::error(&format!("transpile error: {message}"));
+    let path = hmr::normalize_path(file);
+    let diagnostic = serde_json::json!({
+        "type": "error",
+        "path": path,
+        "file": file,
+        "message": message,
+    })
+    .to_string();
+    let mut active = diagnostics.write().unwrap();
+    active.insert(path, diagnostic.clone());
+    tx.send(diagnostic).ok();
 }
 
 async fn request_middleware(
@@ -326,20 +385,8 @@ async fn request_middleware(
                         .into_response();
                 }
                 Err(e) => {
-                    // Phase 7: broadcast error for overlay + console fallback
-                    log::error(&format!("transpile error: {e}"));
-                    let error_msg = serde_json::json!({
-                        "type": "error",
-                        "file": rel_path,
-                        "message": e,
-                    });
-                    state.tx.send(error_msg.to_string()).ok();
-                    let escaped = e.replace('\\', "\\\\").replace('`', "\\`");
-                    return (
-                        [(header::CONTENT_TYPE, "application/javascript")],
-                        format!("console.error(`[rush] {escaped}`);"),
-                    )
-                        .into_response();
+                    publish_transpile_error(&state.tx, &state.diagnostics, rel_path, &e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
                 }
             }
         }
@@ -510,12 +557,14 @@ async fn main() {
     }
 
     let (tx, _rx) = broadcast::channel::<String>(16);
+    let diagnostics = Diagnostics::default();
     let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
 
     // Spawn debounced file watcher in background thread
     let watcher_root = root.clone();
     let watcher_tx = tx.clone();
     let watcher_graph = graph.clone();
+    let watcher_diagnostics = diagnostics.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(50));
@@ -560,6 +609,21 @@ async fn main() {
                         });
                         watcher_tx.send(msg.to_string()).ok();
                     } else if matches!(ext, "js" | "ts" | "jsx" | "tsx") {
+                        let changed = hmr::normalize_path(&rel);
+                        if matches!(ext, "ts" | "jsx" | "tsx") {
+                            if let Ok(source) = std::fs::read_to_string(&event.path) {
+                                if let Err(error) = transform::check_syntax(&rel, &source) {
+                                    publish_transpile_error(
+                                        &watcher_tx,
+                                        &watcher_diagnostics,
+                                        &rel,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
+                            watcher_diagnostics.write().unwrap().remove(&changed);
+                        }
                         let boundaries = watcher_graph.write().unwrap().invalidate(&rel, now);
                         if let Some(targets) = boundaries {
                             log::event("hot update:", &format!("{:?}", targets));
@@ -567,6 +631,7 @@ async fn main() {
                                 let msg = serde_json::json!({
                                     "type": "js-update",
                                     "path": target,
+                                    "changed": changed,
                                     "timestamp": now,
                                 });
                                 watcher_tx.send(msg.to_string()).ok();
@@ -616,6 +681,7 @@ async fn main() {
     let state = AppState {
         root: root.clone(),
         tx,
+        diagnostics,
         graph,
         source_maps,
         env_vars,

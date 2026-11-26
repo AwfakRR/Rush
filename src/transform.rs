@@ -1,5 +1,6 @@
 use oxc::{
     allocator::Allocator,
+    ast::ast::Program,
     codegen::Codegen,
     parser::Parser,
     semantic::SemanticBuilder,
@@ -15,22 +16,38 @@ pub struct Transpiled {
     pub refresh_signature: bool,
 }
 
+fn parse<'a>(
+    allocator: &'a Allocator,
+    filename: &str,
+    source: &'a str,
+) -> Result<Program<'a>, String> {
+    let source_type = SourceType::from_path(Path::new(filename))
+        .map_err(|e| format!("Unknown file type {filename}: {e}"))?;
+    let parsed = Parser::new(allocator, source, source_type).parse();
+    // ponytail: oxc parser is error-recovering. Only fail if AST body is completely empty with errors.
+    if parsed.program.body.is_empty() && !parsed.diagnostics.is_empty() && !source.trim().is_empty()
+    {
+        return Err(format!(
+            "Parse error in {filename}: {:?}",
+            parsed.diagnostics
+        ));
+    }
+    Ok(parsed.program)
+}
+
+pub fn check_syntax(filename: &str, source: &str) -> Result<(), String> {
+    parse(&Allocator::default(), filename, source).map(|_| ())
+}
+
 /// Transpile TS/TSX/JSX → JS with an optional source map and React Refresh hooks.
 /// ponytail: one function, no config struct, defaults handle 99% of cases.
 /// Custom JSX pragma or tsconfig paths? Add TransformOptions param when needed.
 pub fn transpile(filename: &str, source: &str) -> Result<Transpiled, String> {
     let path = Path::new(filename);
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path)
-        .map_err(|e| format!("Unknown file type {filename}: {e}"))?;
 
     // 1. Parse source code into AST
-    let parser_ret = Parser::new(&allocator, source, source_type).parse();
-    // ponytail: oxc parser is error-recovering. Only fail if AST body is completely empty with errors.
-    let mut program = parser_ret.program;
-    if program.body.is_empty() && !parser_ret.diagnostics.is_empty() && !source.trim().is_empty() {
-        return Err(format!("Parse error in {filename}: {:?}", parser_ret.diagnostics));
-    }
+    let mut program = parse(&allocator, filename, source)?;
 
     // 2. Semantic analysis (populates scopes and bindings for transformer)
     let semantic_ret = SemanticBuilder::new().build(&program);
