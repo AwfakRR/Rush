@@ -28,6 +28,7 @@ mod log;
 mod env;
 mod alias;
 mod build;
+mod css;
 #[cfg(test)]
 mod test_util;
 
@@ -40,6 +41,7 @@ struct AppState {
     env_vars: Arc<HashMap<String, String>>,
     proxies: Arc<Vec<(String, String)>>,
     aliases: Arc<Vec<(String, String)>>,
+    styles: Arc<css::StyleCache>,
 }
 
 const HMR_CLIENT: &str = r#"(() => {
@@ -70,7 +72,7 @@ const HMR_CLIENT: &str = r#"(() => {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${proto}//${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
-  socket.addEventListener('message', ({ data }) => {
+  socket.addEventListener('message', async ({ data }) => {
     let msg;
     try {
       msg = JSON.parse(data);
@@ -87,6 +89,22 @@ const HMR_CLIENT: &str = r#"(() => {
       const links = document.querySelectorAll('link[rel="stylesheet"]');
       for (const link of links) {
         const url = new URL(link.href);
+        if (url.origin !== location.origin) continue;
+        if (link.dataset.rushClasses !== undefined) {
+          const classesUrl = new URL(url.pathname, url.origin);
+          classesUrl.search = '?rush-css-classes';
+          try {
+            const response = await fetch(classesUrl, { cache: 'no-store' });
+            if (!response.ok) continue;
+            if (await response.text() !== link.dataset.rushClasses) {
+              location.reload();
+              return;
+            }
+          } catch (err) {
+            console.error('[rush] CSS update failed:', err);
+            continue;
+          }
+        }
         url.searchParams.set('t', Date.now());
         link.href = url.href;
       }
@@ -169,6 +187,73 @@ async fn handle_ws(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
     }
 }
 
+async fn serve_css(
+    state: &AppState,
+    path: &str,
+    query: &str,
+    script_destination: bool,
+    target: PathBuf,
+) -> Option<Response> {
+    let is_import = script_destination || query.split('&').any(|part| part == "import");
+    let is_module = css::is_module(&target);
+    let classes_only = is_module && query.split('&').any(|part| part == "rush-css-classes");
+    if !is_import && !is_module && !css::configured(&state.root) {
+        return None;
+    }
+
+    let style = if is_module || !is_import {
+        let styles = state.styles.clone();
+        let root = state.root.clone();
+        match tokio::task::spawn_blocking(move || styles.get(&root, &target)).await {
+            Ok(Ok(style)) => Some(style),
+            result => {
+                let message = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => error.to_string(),
+                    _ => unreachable!(),
+                };
+                log::error(&message);
+                let msg = serde_json::json!({ "type": "error", "file": path, "message": message });
+                state.tx.send(msg.to_string()).ok();
+                return Some((axum::http::StatusCode::INTERNAL_SERVER_ERROR, message).into_response());
+            }
+        }
+    } else {
+        None
+    };
+
+    let (content_type, body) = if classes_only {
+        ("application/json", style.unwrap().class_json())
+    } else if is_import {
+        let path = serde_json::to_string(path).unwrap();
+        let classes = style.as_ref().map(|style| {
+            let json = serde_json::to_string(&style.class_json()).unwrap();
+            format!("link.dataset.rushClasses = {json};")
+        }).unwrap_or_default();
+        let exports = style.as_ref().map_or("export {};", |style| &style.exports);
+        ("application/javascript", format!(r#"const url = new URL({path}, location.origin);
+let link = [...document.querySelectorAll('link[rel="stylesheet"]')].find(link => {{
+  const existing = new URL(link.href);
+  return existing.origin === url.origin && existing.pathname === url.pathname;
+}});
+if (!link) {{
+  link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = url.href;
+  document.head.append(link);
+}}
+{classes}
+{exports}"#))
+    } else {
+        ("text/css", style.unwrap().css.clone())
+    };
+    Some(([
+        (header::CONTENT_TYPE, content_type),
+        (header::VARY, "Sec-Fetch-Dest"),
+        (header::CACHE_CONTROL, "no-cache"),
+    ], body).into_response())
+}
+
 async fn request_middleware(
     State(state): State<AppState>,
     req: Request,
@@ -219,6 +304,19 @@ async fn request_middleware(
     };
 
     let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    if ext == "css" && target.is_file()
+        && Path::new(rel_path).components().all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        let query = req.uri().query().unwrap_or_default();
+        let script_destination = req.headers().get("sec-fetch-dest").is_some_and(|value| value == "script");
+        if let Some(response) = serve_css(&state, path, query, script_destination, target).await {
+            return response;
+        }
+        let mut response = next.run(req).await;
+        response.headers_mut().append(header::VARY, "Sec-Fetch-Dest".parse().unwrap());
+        return response;
+    }
 
     // Phase 5: Serve in-memory source map
     if path.ends_with(".map") {
@@ -497,11 +595,13 @@ async fn main() {
 
     let (tx, _rx) = broadcast::channel::<String>(16);
     let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
+    let styles = Arc::new(css::StyleCache::default());
 
     // Spawn debounced file watcher in background thread
     let watcher_root = root.clone();
     let watcher_tx = tx.clone();
     let watcher_graph = graph.clone();
+    let watcher_styles = styles.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
         let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(50));
@@ -518,12 +618,27 @@ async fn main() {
             return;
         }
 
+        let mut had_postcss = css::configured(&watcher_root);
         while let Ok(events) = sync_rx.recv() {
             if let Ok(events) = events {
+                let events: Vec<_> = events.into_iter().filter(|event| !should_ignore(&event.path)).collect();
+                if events.is_empty() {
+                    continue;
+                }
+                let has_postcss = css::configured(&watcher_root);
+                let postcss_affected = has_postcss || had_postcss;
+                had_postcss = has_postcss;
+                let has_css_event = events.iter().any(|event| {
+                    event.path.extension().is_some_and(|ext| ext == "css") || css::is_config(&event.path)
+                });
+                if has_css_event || postcss_affected {
+                    watcher_styles.invalidate();
+                }
+                if postcss_affected && !has_css_event {
+                    watcher_tx.send(r#"{"type":"css","path":"*"}"#.to_string()).ok();
+                }
+                let mut css_sent = false;
                 for event in events {
-                    if should_ignore(&event.path) {
-                        continue;
-                    }
                     let rel = event
                         .path
                         .strip_prefix(&watcher_root)
@@ -537,7 +652,11 @@ async fn main() {
                         .unwrap_or_default()
                         .as_millis();
 
-                    if ext == "css" {
+                    if ext == "css" || css::is_config(&event.path) {
+                        if css_sent {
+                            continue;
+                        }
+                        css_sent = true;
                         log::event("css update:", &rel);
                         let msg = serde_json::json!({
                             "type": "css",
@@ -607,6 +726,7 @@ async fn main() {
         env_vars,
         proxies,
         aliases,
+        styles,
     };
 
     let app = Router::new()
