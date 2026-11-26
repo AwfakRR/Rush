@@ -76,6 +76,7 @@ cargo build --release
 |---|---|---|---|
 | `rush build` | - | - | Bundle project for production into `dist/` |
 | `rush build --lib [--entry <path>]` | - | - | Bundle a library and emit TypeScript declarations into `dist/` |
+| `rush build --ssr <entry>` | - | - | Build client assets and a Node server bundle |
 | `--port <port>` | `-p` | `3000` | Port for the HTTP and WebSocket server |
 | `--root <dir>` | `-r` | `.` | Root directory containing static files and source code |
 | `--open` | `-o` | - | Auto-open browser on server start |
@@ -131,6 +132,63 @@ rush --root ./example-vue --port 5173
 
 rush build --root ./example-vue
 python3 -m http.server 8080 --directory ./example-vue/dist
+```
+
+### Server-Side Rendering (SSR)
+
+In development, run Rush for the browser assets and HMR, and use the Node helper
+[`ssr.mjs`](ssr.mjs) in your HTTP server. SSR requires Node.js 20+ and
+`esbuild` installed in the app. Entries are paths relative to the project root:
+
+```js
+import { createSsrLoader } from './ssr.mjs';
+
+const loader = createSsrLoader({ root: process.cwd(), origin: 'http://127.0.0.1:5173' });
+// In the request handler:
+const { render } = await loader.ssrLoadModule('src/entry-server.tsx');
+const markup = await render();
+// At server shutdown: await loader.close();
+```
+
+The helper runs the `rush` executable on PATH (override it with the `rush`
+option). Use the same project root for the helper and the dev server. Rush uses
+its esbuild pipeline with a Node target, TypeScript/JSX and SSR-aware plugin
+hooks; browser-only HMR wrappers and CSS side effects don't run on the server.
+CSS Module class names are available in both environments. The loader caches
+the evaluated module until Rush's watcher detects a project edit, including
+transitive dependencies. Call `ssrLoadModule` in each request rather than
+keeping the initial module at startup. Installed packages remain external and
+are loaded by Node. As with any local dev server, only run against trusted
+projects; never use this loader in production.
+
+Serve the browser scripts and `/__hmr.js` from Rush on the page's origin to
+keep client updates working. The example uses Rush's HTTP proxy to forward
+only the page route to Node; Node sends the rendered markup and the browser
+entry calls React's `hydrateRoot`.
+
+`rush build --ssr <entry>` runs the normal HTML/client build and adds
+`dist/server/entry.mjs` and `dist/ssr-manifest.json`. Import the server entry
+from Node and keep the app's runtime dependencies installed. The manifest maps
+each HTML page with a module script to `{ "script": "./assets/…", "css": [...] }`,
+with URLs relative to the client output root. Use it to add the client script
+and styles to your rendered HTML. Serve only client assets publicly, not
+`dist/server/`.
+
+Run the [React SSR example](example-ssr/) from the repository root:
+
+```sh
+cargo build
+export PATH="$PWD/target/debug:$PATH"  # also set this in the second terminal
+cd example-ssr
+npm ci
+npm run dev:rush                      # terminal 1
+npm run dev                           # terminal 2, also in example-ssr
+# Visit http://127.0.0.1:5173/ssr/ and click the counter.
+
+# Stop the dev servers before starting production.
+npm run build
+npm start
+# Visit http://127.0.0.1:4173/ and click the counter again.
 ```
 
 ### Library Mode
