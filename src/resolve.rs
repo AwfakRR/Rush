@@ -126,10 +126,7 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
     };
     let pkg_dir = root.join("node_modules").join(package_name);
     let pkg_json_path = pkg_dir.join("package.json");
-    let Ok(raw) = std::fs::read_to_string(&pkg_json_path) else {
-        let subpath = pkg_dir.with_extension("js");
-        return (package_name.contains('/') && subpath.is_file()).then_some(subpath);
-    };
+    let raw = std::fs::read_to_string(&pkg_json_path).ok()?;
     let pkg: serde_json::Value = serde_json::from_str(&raw).ok()?;
 
     // 1. Check "exports" field
@@ -149,9 +146,20 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
                 return Some(pkg_dir.join(p));
             }
         }
-    }
-    if export_key != "." {
-        return None;
+        if export_key != "." {
+            return None;
+        }
+    } else if let Some(subpath) = export_key.strip_prefix("./") {
+        if !Path::new(subpath)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let file = pkg_dir.join(subpath);
+        return [file.clone(), file.with_added_extension("js")]
+            .into_iter()
+            .find(|candidate| candidate.is_file());
     }
 
     // 2. Check "module" field (standard for modern ESM builds)
@@ -183,7 +191,7 @@ pub struct DepCache {
 /// ponytail: DefaultHasher, no crypto crate needed for cache invalidation.
 pub fn lockfile_hash(root: &Path) -> String {
     let mut hasher = DefaultHasher::new();
-    "development-jsx-runtime-v1".hash(&mut hasher);
+    "development-jsx-runtime-v2".hash(&mut hasher);
     for name in ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package.json"] {
         let p = root.join(name);
         if let Ok(bytes) = std::fs::read(&p) {
@@ -547,6 +555,7 @@ export * from 'lodash-es';"#;
                 name,
                 r#"{"main":"./main.js","exports":{"./client":"./client.js"}}"#,
             );
+            dir.write(&format!("node_modules/{name}/private.js"), "");
             assert_eq!(
                 resolve_package_entry(dir.path(), &format!("{name}/client")),
                 Some(dir.path().join("node_modules").join(name).join("client.js")),
@@ -556,6 +565,18 @@ export * from 'lodash-es';"#;
                 None
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_legacy_jsx_runtime_subpath() {
+        let dir = TempDir::new();
+        pkg(&dir, "react", r#"{"main":"index.js"}"#);
+        dir.write("node_modules/react/jsx-runtime.js", "");
+        assert_eq!(
+            resolve_package_entry(dir.path(), "react/jsx-runtime"),
+            Some(dir.path().join("node_modules/react/jsx-runtime.js")),
+        );
+        assert_eq!(resolve_package_entry(dir.path(), "react/missing"), None);
     }
 
     #[test]
