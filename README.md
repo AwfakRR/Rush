@@ -16,6 +16,7 @@
   <a href="#example-project">Example</a> •
   <a href="#architecture--design-philosophy">Architecture & Philosophy</a> •
   <a href="#testing">Testing</a> •
+  <a href="#benchmarks">Benchmarks</a> •
   <a href="#roadmap">Roadmap</a> •
   <a href="#license">License</a>
 </p>
@@ -162,6 +163,10 @@ cargo test
 
 - **Unit tests** (in `src/`): transpilation and source maps, bare-import rewriting and package entry resolution, path aliases, `.env` loading, and the HMR module graph (boundaries, cycles, stale edges).
 - **Integration tests** (in `tests/`): start a real `rush` process on a temp project and check served output, SPA fallback, JSON/asset modules, `--proxy`, the HMR messages sent over `/__hmr` when files change, and `rush build`.
+
+## Benchmarks
+
+See the [reproducible cold-start and HMR benchmarks](bench/README.md) for Rush, Vite, and Rspack, including the methodology and sample results.
 
 ## Roadmap
 
