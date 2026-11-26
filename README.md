@@ -56,6 +56,7 @@ Clone the repository and run:
 cargo run
 
 # Serve a specific folder on a custom port and auto-open browser
+npm ci --prefix example
 cargo run -- --root ./example --port 5173 --open
 ```
 
@@ -103,6 +104,27 @@ cargo run -- --root ./app --proxy /api=http://localhost:8080
 
 ---
 
+## CSS Modules, PostCSS, and Tailwind
+
+Rush serves regular stylesheets linked from HTML or imported for their side effects in JavaScript (`import './style.css'`). To scope classes to a file, use a `.module.css` extension and import its class map:
+
+```js
+import styles, { button } from './button.module.css';
+element.classList.add(styles.button); // same as the named export button
+```
+
+Install Node.js and the following packages in the project for CSS Modules. Class names are scoped by file and are the same in development and production. Class names such as `primary-button` are available on the default map as `styles['primary-button']`.
+
+```bash
+npm install -D esbuild postcss postcss-modules
+```
+
+For a PostCSS project, install `postcss` and `postcss-load-config` alongside the project's plugins. Rush loads the root PostCSS config in both dev and `rush build` (`postcss.config.js`, `.cjs`, `.mjs`, `.postcssrc` and its supported extensions, or the `postcss` field in `package.json`). YAML and TypeScript config formats may require the optional loader dependencies documented by [postcss-load-config](https://github.com/postcss/postcss-load-config). Production builds with PostCSS or CSS Module imports use the project's installed `esbuild` package.
+
+The example uses Tailwind v4. Install `tailwindcss` and `@tailwindcss/postcss`, add `'@tailwindcss/postcss': {}` to the PostCSS config's `plugins` object, and put `@import "tailwindcss";` in the global stylesheet. Automatic content detection works from the project root; add an `@source` directive to include files Tailwind would otherwise skip. In dev, Rush invalidates the PostCSS cache on project edits so Tailwind picks up added or removed classes. Tailwind v3 still works with its `tailwindcss` PostCSS plugin, explicit content globs, and `@tailwind` directives.
+
+Stylesheet edits hot-swap the CSS without losing page state. If a CSS Module's exported classes change, Rush reloads the page so importers receive the new map.
+
 ## Example Project
 
 The included `example/` folder demonstrates Rush serving HTML, CSS, JavaScript, and TypeScript together:
@@ -110,7 +132,9 @@ The included `example/` folder demonstrates Rush serving HTML, CSS, JavaScript, 
 ```
 example/
 ├── index.html     # HTML entry point (Rush injects client script)
-├── style.css      # Stylesheet (hot-swapped on save)
+├── style.css      # Global stylesheet with Tailwind utilities
+├── card.module.css # Scoped styles imported from JavaScript
+├── postcss.config.cjs # PostCSS and Tailwind configuration
 ├── main.js        # JavaScript application code
 ├── counter.ts     # TypeScript file with import.meta.hot.accept()
 ├── config.json    # JSON module imported directly into JS
@@ -121,6 +145,7 @@ example/
 Start the demo server:
 
 ```bash
+npm ci --prefix example
 cargo run -- --root example --port 3000 --open
 ```
 
@@ -157,7 +182,7 @@ Rush is built on **radical pragmatism and first-principles simplicity**: deliver
 ## Testing
 
 ```bash
-npm install --prefix example   # esbuild, used by the `rush build` tests
+npm ci --prefix example   # Node dependencies used by the build and CSS integration tests
 cargo test
 ```
 
