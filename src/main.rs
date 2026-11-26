@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Request, State,
     },
-    http::header,
+    http::{header, StatusCode},
     middleware::{from_fn_with_state, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -41,6 +41,7 @@ mod test_util;
 struct AppState {
     root: PathBuf,
     tx: broadcast::Sender<String>,
+    diagnostics: Diagnostics,
     graph: Arc<RwLock<hmr::ModuleGraph>>,
     source_maps: Arc<RwLock<HashMap<String, String>>>,
     env_vars: Arc<HashMap<String, String>>,
@@ -52,7 +53,11 @@ struct AppState {
     ssr_version: Arc<AtomicU64>,
 }
 
-const HMR_CLIENT: &str = r#"(() => {
+type Diagnostics = Arc<RwLock<HashMap<String, String>>>;
+
+const HMR_CLIENT: &str = r#"import refresh from '/@react-refresh';
+
+(() => {
   // Phase 7: Error overlay helpers
   // ponytail: inline DOM creation, no framework, no shadow DOM. CSS scoped by id.
   function showOverlay(msg) {
@@ -66,21 +71,35 @@ const HMR_CLIENT: &str = r#"(() => {
     }
     el.querySelector('pre').textContent = msg;
   }
-  function clearOverlay() {
-    document.getElementById('__rush_error')?.remove();
+  const errors = new Map();
+  function updateOverlay() {
+    if (errors.size) {
+      showOverlay([...errors.values()].join('\n\n'));
+    } else {
+      document.getElementById('__rush_error')?.remove();
+    }
   }
 
-  // Phase 15: React Fast Refresh runtime hooks
-  window.$RefreshReg$ = window.$RefreshReg$ || ((type, id) => {
-    window.__rush_refresh_registry = window.__rush_refresh_registry || new Map();
-    window.__rush_refresh_registry.set(id, type);
-  });
-  window.$RefreshSig$ = window.$RefreshSig$ || (() => (type) => type);
+  let reloading = false;
+  function reloadOnce() {
+    if (reloading) return;
+    reloading = true;
+    location.reload();
+  }
+
+  let refreshTimer;
+  function canRefresh(previous, next) {
+    const names = Object.keys(previous);
+    return names.length > 0 && names.length === Object.keys(next).length &&
+      names.every(name => refresh.isLikelyComponentType(previous[name]) &&
+        refresh.isLikelyComponentType(next[name]));
+  }
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const socket = new WebSocket(`${proto}//${location.host}/__hmr`);
   socket.addEventListener('open', () => console.log('[rush] connected'));
   socket.addEventListener('message', async ({ data }) => {
+    if (reloading) return;
     let msg;
     try {
       msg = JSON.parse(data);
@@ -90,9 +109,9 @@ const HMR_CLIENT: &str = r#"(() => {
 
     if (msg.type === 'error') {
       console.error('[rush]', msg.message);
-      showOverlay(msg.file ? msg.file + '\n\n' + msg.message : msg.message);
+      errors.set(msg.path ?? msg.file, msg.file ? msg.file + '\n\n' + msg.message : msg.message);
+      updateOverlay();
     } else if (msg.type === 'css') {
-      clearOverlay();
       console.log('[rush] css update:', msg.path);
       const links = document.querySelectorAll('link[rel="stylesheet"]');
       for (const link of links) {
@@ -105,7 +124,7 @@ const HMR_CLIENT: &str = r#"(() => {
             const response = await fetch(classesUrl, { cache: 'no-store' });
             if (!response.ok) continue;
             if (await response.text() !== link.dataset.rushClasses) {
-              location.reload();
+              reloadOnce();
               return;
             }
           } catch (err) {
@@ -113,63 +132,90 @@ const HMR_CLIENT: &str = r#"(() => {
             continue;
           }
         }
+        if (errors.has(url.pathname)) {
+          link.addEventListener('load', () => {
+            if (errors.delete(url.pathname)) updateOverlay();
+          }, { once: true });
+        }
         url.searchParams.set('t', Date.now());
         link.href = url.href;
       }
     } else if (msg.type === 'js-update') {
-      clearOverlay();
       console.log('[rush] hot update:', msg.path);
+      const changed = msg.changed ?? msg.path;
       const ctx = window.__rush_hot?.get(msg.path);
-      if (!ctx) return;
-      const { _acceptCallbacks: accept, _disposeCallbacks: dispose } = ctx;
-      const styleRevision = ctx.data.rushStyleRevision;
-      ctx._acceptCallbacks = [];
-      ctx._disposeCallbacks = [];
+      if (!ctx && !errors.has(changed)) return;
+      const previousUrl = ctx?._refreshUrl;
+      const { _acceptCallbacks: accept = [], _disposeCallbacks: dispose = [] } = ctx ?? {};
+      const styleRevision = ctx?.data.rushStyleRevision;
+      if (ctx) {
+        ctx._acceptCallbacks = [];
+        ctx._disposeCallbacks = [];
+      }
       for (const cb of dispose) {
         try { cb(ctx.data); } catch (e) { console.error(e); }
       }
-      import(`${msg.path}?t=${msg.timestamp}`).then(newMod => {
+      const nextUrl = `${msg.path}?t=${msg.timestamp}`;
+      import(nextUrl).then(async newMod => {
+        if (!ctx) {
+          reloadOnce();
+          return;
+        }
+        if (previousUrl) {
+          if (ctx._refreshUrl !== new URL(nextUrl, location.href).href ||
+              !canRefresh(await import(previousUrl), newMod)) {
+            reloadOnce();
+            return;
+          }
+          clearTimeout(refreshTimer);
+          refreshTimer = setTimeout(() => refresh.performReactRefresh(), 16);
+        }
         if (styleRevision && styleRevision === ctx.data.rushStyleRevision) {
           ctx._acceptCallbacks = accept;
-          return;
+        } else {
+          for (const cb of accept) {
+            try { cb(newMod); } catch (e) { console.error(e); }
+          }
         }
-        for (const cb of accept) {
-          try { cb(newMod); } catch (e) { console.error(e); }
-        }
+        if (errors.delete(changed)) updateOverlay();
       }).catch(err => {
-        if (ctx.data.rushFramework) {
+        if (ctx) {
           ctx._acceptCallbacks = accept;
           ctx._disposeCallbacks = dispose;
-          console.error('[rush] component update failed:', err);
-          return;
+          ctx._refreshUrl = previousUrl;
         }
-        console.error('[rush] hot update failed, reloading:', err);
-        location.reload();
+        console.error('[rush] hot update failed:', err);
+        if (!errors.has(changed)) errors.set(changed, `${changed}\n\n${err}`);
+        updateOverlay();
       });
     } else {
-      clearOverlay();
       console.log('[rush] full reload');
-      location.reload();
+      reloadOnce();
     }
   });
   socket.addEventListener('close', () => {
     console.log('[rush] disconnected, reconnecting...');
-    setTimeout(() => location.reload(), 1500);
+    setTimeout(reloadOnce, 1500);
   });
 })();"#;
 
 fn inject_hmr(html: &str) -> String {
-    let script = r#"<script type="module" src="/__hmr.js"></script>"#;
+    let script = r#"<script type="module">
+import refresh from '/@react-refresh';
+refresh.injectIntoGlobalHook(window);
+window.$RefreshReg$ = () => {};
+window.$RefreshSig$ = () => type => type;
+</script>
+<script type="module" src="/__hmr.js"></script>"#;
     // ponytail: simple string search, no HTML parser needed
-    if let Some(pos) = html.find("</head>") {
-        let (before, after) = html.split_at(pos);
-        format!("{before}{script}\n{after}")
-    } else if let Some(pos) = html.find("</body>") {
-        let (before, after) = html.split_at(pos);
-        format!("{before}{script}\n{after}")
-    } else {
-        format!("{script}\n{html}")
-    }
+    let lower = html.to_ascii_lowercase();
+    let pos = ["<script", "</head>", "</body>"]
+        .iter()
+        .filter_map(|tag| lower.find(tag))
+        .min()
+        .unwrap_or(0);
+    let (before, after) = html.split_at(pos);
+    format!("{before}{script}\n{after}")
 }
 
 async fn hmr_client() -> impl IntoResponse {
@@ -183,33 +229,61 @@ async fn ssr_version_handler(State(state): State<AppState>) -> impl IntoResponse
     )
 }
 
-// Phase 15: React Fast Refresh runtime virtual module
 async fn react_refresh_runtime() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "application/javascript")],
-        r#"
-let isMounted = false;
-export default {
-  injectIntoGlobalHook(window) {},
-  register(type, id) {
-    if (window.$RefreshReg$) window.$RefreshReg$(type, id);
-  },
-  performReactRefresh() {},
-};
-"#,
+        include_str!("../assets/react-refresh.js"),
     )
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state.tx.subscribe()))
+    ws.on_upgrade(move |socket| async move {
+        let (rx, active) = {
+            let diagnostics = state.diagnostics.read().unwrap();
+            (
+                state.tx.subscribe(),
+                diagnostics.values().cloned().collect(),
+            )
+        };
+        handle_ws(socket, rx, active).await;
+    })
 }
 
-async fn handle_ws(mut socket: WebSocket, mut rx: broadcast::Receiver<String>) {
+async fn handle_ws(
+    mut socket: WebSocket,
+    mut rx: broadcast::Receiver<String>,
+    active: Vec<String>,
+) {
+    for msg in active {
+        if socket.send(Message::Text(msg.into())).await.is_err() {
+            return;
+        }
+    }
     while let Ok(msg) = rx.recv().await {
         if socket.send(Message::Text(msg.into())).await.is_err() {
             break;
         }
     }
+}
+
+fn publish_transpile_error(
+    tx: &broadcast::Sender<String>,
+    diagnostics: &Diagnostics,
+    file: &str,
+    message: &str,
+) {
+    log::error(&format!("transpile error: {message}"));
+    let path = hmr::normalize_path(file);
+    let diagnostic = serde_json::json!({
+        "type": "error",
+        "path": path,
+        "file": file,
+        "message": message,
+    })
+    .to_string();
+    let mut active = diagnostics.write().unwrap();
+    active.insert(path, diagnostic.clone());
+    tx.send(diagnostic).ok();
 }
 
 async fn serve_css(
@@ -277,6 +351,45 @@ if (!link) {{
         (header::VARY, "Sec-Fetch-Dest"),
         (header::CACHE_CONTROL, "no-cache"),
     ], body).into_response())
+}
+
+fn register_module(
+    state: &AppState,
+    code: &str,
+    filename: &str,
+    path: &str,
+    is_accepting: bool,
+) -> String {
+    let imports = resolve::scan_module_imports(code, filename, state.plugins.is_some());
+    let deps: Vec<_> = imports
+        .iter()
+        .filter_map(|(specifier, _, _)| hmr::local_import_path(path, plugins::clean_id(specifier)))
+        .collect();
+    let mut graph = state.graph.write().unwrap();
+    graph.update(path, &deps, is_accepting);
+    resolve::rewrite_imports(code, imports, |specifier| {
+        let dependency = hmr::local_import_path(path, plugins::clean_id(specifier))?;
+        graph.updated_import(specifier, &dependency)
+    })
+}
+
+async fn prepare_module(
+    state: &AppState,
+    code: &str,
+    filename: &str,
+    target: &Path,
+    path: &str,
+    is_accepting: bool,
+) -> Result<String, String> {
+    let aliased = alias::resolve_aliases(code, filename, &state.aliases);
+    let rewritten = plugins::rewrite_imports(state, &aliased, filename, target).await?;
+    Ok(register_module(
+        state,
+        &rewritten,
+        filename,
+        path,
+        is_accepting,
+    ))
 }
 
 async fn request_middleware(
@@ -416,24 +529,7 @@ async fn request_middleware(
         }
     }
 
-    // Helper to register module dependencies into ModuleGraph
-    let register_module = |source: &str, fname: &str| {
-        let is_accepting = hmr::has_hot_accept(source);
-        // Scan after alias rewriting so `@/x` imports land in the graph like `./x`.
-        let aliased = alias::resolve_aliases(source, fname, &state.aliases);
-        let raw_imports = resolve::scan_imports(&aliased, fname);
-        let parent = Path::new(rel_path).parent().unwrap_or(Path::new(""));
-        let mut deps = Vec::new();
-        for (spec, _, _) in raw_imports {
-            if spec.starts_with('.') {
-                let resolved = parent.join(spec);
-                deps.push(hmr::normalize_path(&resolved.to_string_lossy()));
-            }
-        }
-        let mod_path = hmr::normalize_path(rel_path);
-        state.graph.write().unwrap().update(&mod_path, &deps, is_accepting);
-    };
-
+    let mod_path = hmr::normalize_path(rel_path);
     if framework::handles(ext, state.solid) && target.is_file() {
         let root = state.root.clone();
         let component_path = target.clone();
@@ -442,9 +538,16 @@ async fn request_middleware(
         return match result {
             Ok(component) => {
                 let fname = "component.js";
-                register_module(&component.code, fname);
-                let aliased = alias::resolve_aliases(&component.code, fname, &state.aliases);
-                let rewritten = match plugins::rewrite_imports(&state, &aliased, fname, &component_path).await {
+                let rewritten = match prepare_module(
+                    &state,
+                    &component.code,
+                    fname,
+                    &component_path,
+                    &mod_path,
+                    hmr::has_hot_accept(&component.code),
+                )
+                .await
+                {
                     Ok(code) => code,
                     Err(error) => return plugins::error_response(error),
                 };
@@ -454,7 +557,9 @@ async fn request_middleware(
             }
             Err(error) => {
                 log::error(&format!("{rel_path}: {error}"));
-                let message = serde_json::json!({ "type": "error", "file": rel_path, "message": error });
+                let message = serde_json::json!({
+                    "type": "error", "path": mod_path, "file": rel_path, "message": error,
+                });
                 state.tx.send(message.to_string()).ok();
                 (axum::http::StatusCode::INTERNAL_SERVER_ERROR, error).into_response()
             }
@@ -467,21 +572,31 @@ async fn request_middleware(
     if target.is_file() && matches!(ext, "ts" | "tsx" | "jsx") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
-            register_module(&source, &fname);
             match transform::transpile(&fname, &source) {
-                Ok((code, _map)) => {
-                    // Phase 11: Resolve path aliases before bare import rewriting
-                    let aliased = alias::resolve_aliases(&code, &fname, &state.aliases);
-                    // Phase 2: Rewrite bare imports before serving to browser
-                    let rewritten = match plugins::rewrite_imports(&state, &aliased, &fname, &target).await {
+                Ok(transformed) => {
+                    let explicit = hmr::has_hot_accept(&source);
+                    let mut rewritten = match prepare_module(
+                        &state,
+                        &transformed.code,
+                        &fname,
+                        &target,
+                        &mod_path,
+                        explicit || transformed.refresh_registration,
+                    )
+                    .await
+                    {
                         Ok(code) => code,
                         Err(error) => return plugins::error_response(error),
                     };
-                    // Phase 4: Inject import.meta.hot preamble
-                    let mod_path = hmr::normalize_path(rel_path);
+                    if transformed.refresh_registration || transformed.refresh_signature {
+                        rewritten = hmr::inject_refresh_preamble(
+                            &rewritten,
+                            transformed.refresh_registration && !explicit,
+                        );
+                    }
                     let mut with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
                     // Phase 5: Cache source map and append sourceMappingURL
-                    if let Some(map_json) = _map {
+                    if let Some(map_json) = transformed.map {
                         let map_path = format!("{mod_path}.map");
                         state.source_maps.write().unwrap().insert(map_path.clone(), map_json);
                         with_hmr.push_str(&format!("\n//# sourceMappingURL={map_path}\n"));
@@ -492,20 +607,8 @@ async fn request_middleware(
                         .into_response();
                 }
                 Err(e) => {
-                    // Phase 7: broadcast error for overlay + console fallback
-                    log::error(&format!("transpile error: {e}"));
-                    let error_msg = serde_json::json!({
-                        "type": "error",
-                        "file": rel_path,
-                        "message": e,
-                    });
-                    state.tx.send(error_msg.to_string()).ok();
-                    let escaped = e.replace('\\', "\\\\").replace('`', "\\`");
-                    return (
-                        [(header::CONTENT_TYPE, "application/javascript")],
-                        format!("console.error(`[rush] {escaped}`);"),
-                    )
-                        .into_response();
+                    publish_transpile_error(&state.tx, &state.diagnostics, rel_path, &e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
                 }
             }
         }
@@ -515,15 +618,19 @@ async fn request_middleware(
     if target.is_file() && (ext == "js" || state.plugins.is_some() && ext == "mjs") {
         if let Ok(source) = tokio::fs::read_to_string(&target).await {
             let fname = target.file_name().unwrap().to_string_lossy().to_string();
-            register_module(&source, &fname);
-            // Phase 11: Resolve path aliases before bare import rewriting
-            let aliased = alias::resolve_aliases(&source, &fname, &state.aliases);
-            let rewritten = match plugins::rewrite_imports(&state, &aliased, &fname, &target).await {
+            let rewritten = match prepare_module(
+                &state,
+                &source,
+                &fname,
+                &target,
+                &mod_path,
+                hmr::has_hot_accept(&source),
+            )
+            .await
+            {
                 Ok(code) => code,
                 Err(error) => return plugins::error_response(error),
             };
-            // Phase 4: Inject import.meta.hot preamble
-            let mod_path = hmr::normalize_path(rel_path);
             let with_hmr = hmr::inject_hot_preamble(&rewritten, &mod_path);
             // Phase 9: Replace import.meta.env.* references
             let final_code = env::replace_env_vars(&with_hmr, &state.env_vars);
@@ -752,6 +859,7 @@ async fn main() {
     }
 
     let (tx, _rx) = broadcast::channel::<String>(16);
+    let diagnostics = Diagnostics::default();
     let graph = Arc::new(RwLock::new(hmr::ModuleGraph::new()));
     let styles = Arc::new(css::StyleCache::default());
     let ssr_version = Arc::new(AtomicU64::new(
@@ -765,6 +873,7 @@ async fn main() {
     let watcher_root = root.clone();
     let watcher_tx = tx.clone();
     let watcher_graph = graph.clone();
+    let watcher_diagnostics = diagnostics.clone();
     let watcher_styles = styles.clone();
     let watcher_ssr_version = ssr_version.clone();
     std::thread::spawn(move || {
@@ -830,14 +939,30 @@ async fn main() {
                             "timestamp": now,
                         });
                         watcher_tx.send(msg.to_string()).ok();
-                    } else if matches!(ext, "js" | "ts" | "jsx" | "tsx" | "vue" | "svelte") {
-                        let boundaries = watcher_graph.read().unwrap().find_update_boundaries(&rel);
+                    } else if matches!(ext, "js" | "mjs" | "ts" | "mts" | "jsx" | "tsx" | "vue" | "svelte") {
+                        let changed = hmr::normalize_path(&rel);
+                        if matches!(ext, "ts" | "mts" | "jsx" | "tsx") {
+                            if let Ok(source) = std::fs::read_to_string(&event.path) {
+                                if let Err(error) = transform::check_syntax(&rel, &source) {
+                                    publish_transpile_error(
+                                        &watcher_tx,
+                                        &watcher_diagnostics,
+                                        &rel,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            }
+                            watcher_diagnostics.write().unwrap().remove(&changed);
+                        }
+                        let boundaries = watcher_graph.write().unwrap().invalidate(&rel, now);
                         if let Some(targets) = boundaries {
                             log::event("hot update:", &format!("{:?}", targets));
                             for target in targets {
                                 let msg = serde_json::json!({
                                     "type": "js-update",
                                     "path": target,
+                                    "changed": changed,
                                     "timestamp": now,
                                 });
                                 watcher_tx.send(msg.to_string()).ok();
@@ -887,6 +1012,7 @@ async fn main() {
     let state = AppState {
         root: root.clone(),
         tx,
+        diagnostics,
         graph,
         source_maps,
         env_vars,

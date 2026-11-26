@@ -57,9 +57,7 @@ pub(crate) fn scan_module_imports(source: &str, filename: &str, extended: bool) 
         }
 
         fn visit_export_from_declaration(&mut self, export: &ExportFromDeclaration<'a>) {
-            if self.extended {
-                self.add(&export.source);
-            }
+            self.add(&export.source);
         }
 
         fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
@@ -85,23 +83,31 @@ pub(crate) fn scan_module_imports(source: &str, filename: &str, extended: bool) 
     imports.spans
 }
 
-/// Rewrite bare imports in JS source to point at pre-bundled dependencies.
+/// Rewrite import specifiers using previously scanned spans.
 /// ponytail: modifies string directly using byte offsets in reverse order.
 /// No AST-to-string round-trip, no codegen dependency for this step.
-pub fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> String {
-    let imports = scan_imports(source, filename);
+pub fn rewrite_imports(
+    source: &str,
+    imports: Vec<(String, u32, u32)>,
+    mut replacement: impl FnMut(&str) -> Option<String>,
+) -> String {
     let mut result = source.to_string();
 
     // Process in reverse order so byte offsets remain valid after string replacement
     for (spec, start, end) in imports.into_iter().rev() {
-        if is_bare(&spec) {
-            let target_url = dep_url(deps_dir, &spec);
-            let rewritten = format!("\"{}\"", target_url);
-            result.replace_range((start as usize)..(end as usize), &rewritten);
+        if let Some(url) = replacement(&spec) {
+            let rewritten = serde_json::json!(url).to_string();
+            result.replace_range(start as usize..end as usize, &rewritten);
         }
     }
 
     result
+}
+
+pub fn rewrite_bare_imports(source: &str, filename: &str, deps_dir: &str) -> String {
+    rewrite_imports(source, scan_imports(source, filename), |specifier| {
+        is_bare(specifier).then(|| dep_url(deps_dir, specifier))
+    })
 }
 
 /// Resolve a bare package name to its entry file in node_modules.
@@ -140,9 +146,20 @@ pub fn resolve_package_entry(root: &Path, package_name: &str) -> Option<PathBuf>
                 return Some(pkg_dir.join(p));
             }
         }
-    }
-    if export_key != "." {
-        return None;
+        if export_key != "." {
+            return None;
+        }
+    } else if let Some(subpath) = export_key.strip_prefix("./") {
+        if !Path::new(subpath)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return None;
+        }
+        let file = pkg_dir.join(subpath);
+        return [file.clone(), file.with_added_extension("js")]
+            .into_iter()
+            .find(|candidate| candidate.is_file());
     }
 
     // 2. Check "module" field (standard for modern ESM builds)
@@ -174,6 +191,7 @@ pub struct DepCache {
 /// ponytail: DefaultHasher, no crypto crate needed for cache invalidation.
 pub fn lockfile_hash(root: &Path) -> String {
     let mut hasher = DefaultHasher::new();
+    "development-jsx-runtime-v2".hash(&mut hasher);
     for name in ["package-lock.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package.json"] {
         let p = root.join(name);
         if let Ok(bytes) = std::fs::read(&p) {
@@ -256,6 +274,10 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
     // 2. Scan all project files for bare imports
     let mut bare_set = HashSet::new();
     scan_dir_for_bare_imports(root, root, &mut bare_set);
+    // Automatic JSX imports this entry even when it is not present in the source.
+    if resolve_package_entry(root, "react/jsx-runtime").is_some() {
+        bare_set.insert("react/jsx-runtime".to_string());
+    }
 
     if bare_set.is_empty() {
         return Ok(None);
@@ -294,7 +316,19 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
 
     // Pass entry points: <out_name>=<entry_path>
     for (out_name, entry_path) in &entries {
-        cmd.arg(format!("{}={}", out_name, entry_path.display()));
+        if out_name == "react__jsx-runtime" {
+            // Oxc emits named imports, while React ships this entry as CommonJS.
+            let shim_path = deps_dir.join(".jsx-runtime-entry.mjs");
+            let entry = serde_json::json!(entry_path.to_string_lossy().replace('\\', "/"));
+            std::fs::write(
+                &shim_path,
+                format!("import runtime from {entry};\nexport const {{ jsx, jsxs, Fragment }} = runtime;\nexport default runtime;\n"),
+            )
+            .map_err(|e| e.to_string())?;
+            cmd.arg(format!("{out_name}={}", shim_path.display()));
+        } else {
+            cmd.arg(format!("{out_name}={}", entry_path.display()));
+        }
     }
 
     cmd.args([
@@ -302,6 +336,7 @@ pub fn prebundle(root: &Path) -> Result<Option<DepCache>, String> {
         "--format=esm",
         "--splitting",
         "--platform=browser",
+        "--define:process.env.NODE_ENV=\"development\"",
         "--target=es2020",
         &format!("--outdir={}", deps_dir.display()),
         "--sourcemap",
@@ -520,6 +555,7 @@ export * from 'lodash-es';"#;
                 name,
                 r#"{"main":"./main.js","exports":{"./client":"./client.js"}}"#,
             );
+            dir.write(&format!("node_modules/{name}/private.js"), "");
             assert_eq!(
                 resolve_package_entry(dir.path(), &format!("{name}/client")),
                 Some(dir.path().join("node_modules").join(name).join("client.js")),
@@ -529,6 +565,18 @@ export * from 'lodash-es';"#;
                 None
             );
         }
+    }
+
+    #[test]
+    fn test_resolve_legacy_jsx_runtime_subpath() {
+        let dir = TempDir::new();
+        pkg(&dir, "react", r#"{"main":"index.js"}"#);
+        dir.write("node_modules/react/jsx-runtime.js", "");
+        assert_eq!(
+            resolve_package_entry(dir.path(), "react/jsx-runtime"),
+            Some(dir.path().join("node_modules/react/jsx-runtime.js")),
+        );
+        assert_eq!(resolve_package_entry(dir.path(), "react/missing"), None);
     }
 
     #[test]

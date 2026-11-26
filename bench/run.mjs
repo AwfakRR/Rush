@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
@@ -85,7 +86,45 @@ async function measureEdit(page, marker, source, expected, leaves) {
   }
 }
 
-async function measure(browser, tool, round, fixture, sources) {
+async function checkSyntaxRecovery(context, page, url, marker, source, expected, leaves) {
+  const overlay = (p) => p.locator('#__rush_error');
+  const counter = (p) => p.locator('#counter');
+  const count = await counter(page).textContent();
+  let reloads = 0;
+  page.on('framenavigated', (frame) => { if (frame === page.mainFrame()) reloads++; });
+
+  const working = source.replace(marker.original, marker.updated);
+  const broken = working.replace('  const [counter', '  const broken = ;\n  const [counter');
+  assert.notEqual(broken, working);
+  await writeFile(marker.file, broken);
+  await overlay(page).waitFor({ state: 'visible' });
+  assert.match(await overlay(page).textContent(), /Unexpected token/);
+  assert.equal(await counter(page).textContent(), count);
+  assert.equal(reloads, 0);
+
+  const cold = await context.newPage();
+  await cold.goto(url);
+  await overlay(cold).waitFor({ state: 'visible' });
+  assert.equal(await counter(cold).count(), 0);
+  let coldReloads = 0;
+  cold.on('framenavigated', (frame) => { if (frame === cold.mainFrame()) coldReloads++; });
+
+  const fixedMarker = `${marker.updated}:fixed`;
+  await writeFile(marker.file, working.replace(marker.updated, fixedMarker));
+  const recovered = { ...expected, [marker.id]: fixedMarker };
+  await waitForRender(page, recovered, leaves);
+  await overlay(page).waitFor({ state: 'detached' });
+  assert.equal(await counter(page).textContent(), count);
+  assert.equal(reloads, 0);
+
+  await waitForRender(cold, recovered, leaves);
+  assert.equal(await counter(cold).textContent(), '0');
+  assert.equal(coldReloads, 1);
+  await overlay(cold).waitFor({ state: 'detached' });
+  console.log('Rush syntax recovery: live page kept counter and cleared overlay without reload; initially broken page mounted after one reload.');
+}
+
+async function measure(browser, tool, round, fixture, sources, checkRecovery) {
   const { markers, leaves } = fixture;
   for (const dir of tool.caches) {
     await rm(join(app, dir), { recursive: true, force: true });
@@ -133,6 +172,9 @@ async function measure(browser, tool, round, fixture, sources) {
       const coldMs = performance.now() - startedAt;
       const root = await measureEdit(page, markers.root, sources.root, expected, leaves);
       const leaf = await measureEdit(page, markers.leaf, sources.leaf, expected, leaves);
+      if (checkRecovery) {
+        await checkSyntaxRecovery(context, page, url, markers.root, sources.root, expected, leaves);
+      }
       return { round, startupMs, coldMs, root, leaf };
     } catch (cause) {
       throw new Error(`${tool.name}, run ${round}: ${cause.message}\nServer output:\n${logs}\nBrowser errors:\n${browserErrors.slice(-12).join('\n')}`, { cause });
@@ -218,6 +260,7 @@ async function main() {
     options: {
       components: { type: 'string', default: defaultComponents },
       runs: { type: 'string', default: '5' },
+      'assert-rush-refresh': { type: 'boolean', default: false },
     },
   });
   const components = integer(values.components, '--components', 2);
@@ -238,7 +281,8 @@ async function main() {
       for (let j = 0; j < tools.length; j++) {
         const tool = tools[(i + j) % tools.length];
         console.log(`Run ${i + 1}/${runs}: ${tool.name}`);
-        samples[tool.name].push(await measure(browser, tool, i + 1, fixture, sources));
+        const checkRecovery = values['assert-rush-refresh'] && i === 0 && tool.name === 'Rush';
+        samples[tool.name].push(await measure(browser, tool, i + 1, fixture, sources, checkRecovery));
       }
     }
   } finally {
@@ -249,6 +293,14 @@ async function main() {
   await mkdir(join(bench, 'results'), { recursive: true });
   await writeFile(output, JSON.stringify({ started, components, leaves: fixture.leaves, runs, ...environment, samples, summary }, null, 2) + '\n');
   console.log(`\n${table(summary, runs)}\n\nResults: ${output}`);
+  if (values['assert-rush-refresh']) {
+    for (const [edit, result] of Object.entries({ root: summary.Rush.root, leaf: summary.Rush.leaf })) {
+      if (result.reloadRuns !== 0 || result.statePreservedRuns !== runs) {
+        throw new Error(`Rush ${edit} edit did not preserve state without reloads in every run`);
+      }
+    }
+    console.log('Rush React Fast Refresh passed for every root and leaf edit.');
+  }
 }
 
 await main().catch((error) => {

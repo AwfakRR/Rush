@@ -165,6 +165,47 @@ fn project_modules(project: &Fixture) -> bool {
     true
 }
 
+#[tokio::test]
+async fn dev_plugin_transforms_keep_react_refresh_and_transpile_diagnostics() {
+    if !node_available() {
+        return;
+    }
+    let project = Fixture::new();
+    let app = r#"export default function App() { return <button>BEFORE</button>; }"#;
+    project
+        .write("App.tsx", app)
+        .write("empty.tsx", "")
+        .write("broken.tsx", "export const value = ;")
+        .write(
+            "rush.config.mjs",
+            r#"
+            export default { plugins: [{
+                name: 'replace-button-label',
+                transform(code, id) {
+                    if (id.endsWith('/App.tsx')) return code.replace('BEFORE', 'AFTER');
+                }
+            }] };
+        "#,
+        );
+    let server = Server::start(project.path(), &[]);
+    let response = server.get_text("/App.tsx").await;
+    assert!(
+        response.contains("AFTER") && !response.contains("BEFORE"),
+        "{response}"
+    );
+    assert!(
+        response.contains("import.meta.hot._refreshUrl = import.meta.url"),
+        "{response}"
+    );
+    assert!(!server
+        .get_text("/empty.tsx")
+        .await
+        .contains("_refreshUrl = import.meta.url"));
+    let broken = server.get("/broken.tsx").await;
+    assert_eq!(broken.status(), 500);
+    assert!(broken.text().await.unwrap().contains("Parse error"));
+}
+
 #[cfg(unix)]
 fn build_js(project: &Fixture) -> String {
     let output = rush()

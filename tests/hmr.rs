@@ -93,6 +93,35 @@ async fn self_accepting_module_hot_updates_itself() {
 }
 
 #[tokio::test]
+async fn react_component_hot_updates_without_manual_acceptance() {
+    let initial =
+        "import { label } from './label.ts';\nexport function App() { return <p>{label}</p>; }\n";
+    let f = project();
+    f.write("App.tsx", initial);
+    let (s, mut ws) = start(&f).await;
+    assert!(s
+        .get_text("/App.tsx")
+        .await
+        .contains("import.meta.hot._refreshUrl = import.meta.url"));
+    assert!(!s.get_text("/label.ts").await.contains("/@react-refresh"));
+
+    let updated = initial
+        .replace("<p>", "<strong>")
+        .replace("</p>", "</strong>");
+    let msgs = edit_and_collect(&f, &mut ws, "App.tsx", &updated).await;
+    assert_eq!(kinds(&msgs), vec![pair("js-update", "/App.tsx")]);
+
+    let msgs = edit_and_collect(&f, &mut ws, "label.ts", "export const label = 'new';").await;
+    assert_eq!(kinds(&msgs), vec![pair("js-update", "/App.tsx")]);
+    let timestamp = msgs.last().unwrap()["timestamp"].as_u64().unwrap();
+    let updated = s.get_text(&format!("/App.tsx?t={timestamp}")).await;
+    assert!(
+        updated.contains(&format!("from \"./label.ts?t={timestamp}\"")),
+        "{updated}"
+    );
+}
+
+#[tokio::test]
 async fn dependency_change_propagates_to_accepting_importers() {
     // util.ts is imported by counter.ts ('./util.ts') and App.tsx ('./nested/../util.ts'), both accepting.
     let f = project();
@@ -162,31 +191,65 @@ async fn other_files_trigger_full_reload_and_node_modules_is_ignored() {
 }
 
 #[tokio::test]
-async fn transpile_error_is_broadcast_for_overlay() {
+async fn transpile_error_is_broadcast_and_replayed_for_overlay() {
     let f = project();
-    let (s, mut ws) = start(&f).await;
     f.write("bad.tsx", "export const = ;\n");
-    // Drain the file-change message for bad.tsx before requesting it.
-    let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    while tokio::time::timeout(Duration::from_millis(100), ws.next())
-        .await
-        .is_ok()
-    {}
-
-    s.get_text("/bad.tsx").await;
-    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let msg: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+    let (s, mut ws) = start(&f).await;
+    assert_eq!(
+        s.get("/bad.tsx").await.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let msg = next_message(&mut ws).await;
     assert_eq!(msg["type"], "error");
     assert_eq!(msg["file"], "bad.tsx");
     assert!(msg["message"]
         .as_str()
         .unwrap()
         .contains("Parse error in bad.tsx"));
+
+    let (mut late, _) = connect_async(s.ws_url()).await.unwrap();
+    assert_eq!(next_message(&mut late).await, msg);
+
+    let recovered = edit_and_collect(&f, &mut ws, "bad.tsx", "export const good = 1;").await;
+    assert_eq!(kinds(&recovered), vec![pair("full-reload", "/bad.tsx")]);
+    let (mut fresh, _) = connect_async(s.ws_url()).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), fresh.next())
+            .await
+            .is_err()
+    );
+}
+
+async fn next_message(ws: &mut Ws) -> Value {
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(msg.to_text().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn broken_save_reports_only_an_error_then_recovers() {
+    let f = project();
+    f.write(
+        "App.tsx",
+        "export default function App() { return <p>Before</p>; }",
+    );
+    let (_s, mut ws) = start(&f).await;
+    let broken = "export default function App() { const broken = ; return <p>After</p>; }";
+
+    for path in ["App.tsx", "unserved.tsx"] {
+        let msgs = edit_and_collect(&f, &mut ws, path, broken).await;
+        assert_eq!(kinds(&msgs), vec![pair("error", &format!("/{path}"))]);
+        assert!(msgs[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unexpected token"));
+    }
+    let fixed = "export default function App() { return <p>After</p>; }";
+    let msgs = edit_and_collect(&f, &mut ws, "App.tsx", fixed).await;
+    assert_eq!(kinds(&msgs), vec![pair("js-update", "/App.tsx")]);
 }
 
 #[tokio::test]

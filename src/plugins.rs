@@ -351,38 +351,56 @@ pub async fn serve_module(
         (None, _) if encoded => return Ok(Some(StatusCode::NOT_FOUND.into_response())),
         (None, _) => return Ok(None),
     };
-    let code = if matches!(extension, "ts" | "mts" | "tsx" | "jsx") {
-        transform::transpile(clean_id(&id), &code)?.0
-    } else {
-        code
-    };
-    let alias_code = alias::resolve_aliases(&code, "module.js", &state.aliases);
-    let rewritten = plugins
-        .rewrite_imports(&alias_code, "module.js", &id, &state.root, encoded)
-        .await?;
     let path = disk_file
         .as_ref()
-        .and_then(|file| file.strip_prefix(&state.root).ok());
-    if let Some(path) = path {
-        let parent = path.parent().unwrap_or(Path::new(""));
-        let deps: Vec<_> = resolve::scan_module_imports(&rewritten, "module.js", true)
-            .into_iter()
-            .map(|(spec, _, _)| spec)
-            .filter_map(|spec| {
-                if spec.starts_with('.') {
-                    Some(hmr::normalize_path(&parent.join(spec).to_string_lossy()))
-                } else if spec.starts_with('/') && !spec.starts_with("//") {
-                    Some(hmr::normalize_path(&spec))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        state.graph.write().unwrap().update(
-            &hmr::normalize_path(&path.to_string_lossy()),
-            &deps,
-            !encoded && hmr::has_hot_accept(&code),
+        .and_then(|file| file.strip_prefix(&state.root).ok())
+        .map(|file| hmr::normalize_path(&file.to_string_lossy()));
+    let mut transformed = None;
+    if matches!(extension, "ts" | "mts" | "tsx" | "jsx") {
+        let filename = path.as_deref().unwrap_or_else(|| clean_id(&id));
+        match transform::transpile(filename, &code) {
+            Ok(output) => transformed = Some(output),
+            Err(error) => {
+                crate::publish_transpile_error(&state.tx, &state.diagnostics, filename, &error);
+                return Ok(Some(
+                    (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+                ));
+            }
+        }
+    }
+    let explicit = hmr::has_hot_accept(&code);
+    let refresh = transformed
+        .as_ref()
+        .is_some_and(|output| output.refresh_registration);
+    let code = transformed
+        .as_ref()
+        .map_or(code.as_str(), |output| &output.code);
+    let alias_code = alias::resolve_aliases(code, "module.js", &state.aliases);
+    let mut rewritten = plugins
+        .rewrite_imports(&alias_code, "module.js", &id, &state.root, encoded)
+        .await?;
+    if let Some(path) = &path {
+        rewritten = crate::register_module(
+            state,
+            &rewritten,
+            "module.js",
+            path,
+            !encoded && (explicit || refresh),
         );
+    }
+    if let Some(output) = transformed {
+        if refresh || output.refresh_signature {
+            rewritten = hmr::inject_refresh_preamble(&rewritten, !encoded && refresh && !explicit);
+        }
+        if let (Some(path), Some(map)) = (&path, output.map) {
+            let map_path = format!("{path}.map");
+            state
+                .source_maps
+                .write()
+                .unwrap()
+                .insert(map_path.clone(), map);
+            rewritten.push_str(&format!("\n//# sourceMappingURL={map_path}\n"));
+        }
     }
     let code = hmr::inject_hot_preamble(&rewritten, url);
     let code = env::replace_env_vars(&code, &state.env_vars);

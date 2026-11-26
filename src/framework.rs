@@ -11,14 +11,14 @@ pub fn solid(root: &Path) -> bool {
         .ok()
         .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
         .is_some_and(|package| {
-            [
-                "dependencies",
-                "devDependencies",
-                "peerDependencies",
-                "optionalDependencies",
-            ]
-            .iter()
-            .any(|section| package[*section]["solid-js"].is_string())
+            let runtime_sections = ["dependencies", "peerDependencies", "optionalDependencies"];
+            let has_runtime = |name: &str| {
+                runtime_sections
+                    .iter()
+                    .any(|section| package[*section][name].is_string())
+            };
+            has_runtime("solid-js")
+                || (!has_runtime("react") && package["devDependencies"]["solid-js"].is_string())
         })
 }
 
@@ -129,5 +129,16 @@ mod tests {
         assert!(solid(fixture.path()));
         assert!(handles("tsx", true) && handles("jsx", true));
         assert!(!handles("ts", true));
+    }
+
+    #[test]
+    fn react_app_with_solid_dev_tools_does_not_use_the_solid_compiler() {
+        let fixture = crate::test_util::TempDir::new();
+        fs::write(
+            fixture.path().join("package.json"),
+            r#"{ "dependencies": { "react": "17.0.2" }, "devDependencies": { "solid-js": "^1.9.0" } }"#,
+        )
+        .unwrap();
+        assert!(!solid(fixture.path()));
     }
 }

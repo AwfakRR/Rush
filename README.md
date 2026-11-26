@@ -303,6 +303,7 @@ example/
 ├── postcss.config.cjs # PostCSS and Tailwind configuration
 ├── main.js        # JavaScript application code
 ├── counter.ts     # TypeScript file with import.meta.hot.accept()
+├── RefreshCounter.tsx # React counter with automatic Fast Refresh
 ├── config.json    # JSON module imported directly into JS
 ├── tsconfig.json  # Path aliases (@/* -> ./*)
 └── .env           # Environment variables (RUSH_-prefixed)
@@ -323,7 +324,11 @@ Rush automatically supports HTML5 History API routing. Any navigation request to
 
 ### React Fast Refresh
 
-React JSX/TSX components automatically benefit from React Fast Refresh transforms via `oxc` and runtime hooks, allowing components to hot-reload while preserving state.
+React JSX/TSX modules that export only components can refresh without an
+`import.meta.hot.accept()` call. A markup-only edit preserves React state.
+In the example app, click **React clicks**, then edit the button label in
+`example/RefreshCounter.tsx` to try it. If a module stops being an eligible
+component boundary, Rush falls back to a page reload.
 
 ### Auto-Install Dependencies
 

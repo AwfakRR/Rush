@@ -1,5 +1,8 @@
 import { createCounter } from '@/counter.ts';
 import confetti from 'canvas-confetti';
+import React from 'react';
+import ReactDOM from 'react-dom';
+import RefreshCounter from './RefreshCounter.tsx';
 import styles from './card.module.css';
 import welcome from 'virtual:welcome';
 import pluginDemo from './plugin-demo.yaml';
@@ -13,6 +16,8 @@ btn.addEventListener('click', () => {
   const count = counter.increment();
   btn.textContent = `Clicks: ${count}`;
 });
+
+ReactDOM.render(React.createElement(RefreshCounter), document.getElementById('react-counter'));
 
 const lazyButton = document.getElementById('load-lazy');
 const lazyStatus = document.getElementById('lazy-status');
