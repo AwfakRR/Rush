@@ -79,4 +79,42 @@ mod tests {
         let (code, _) = transpile("Component.tsx", "export function App() { return <h1>Hello</h1>; }").unwrap();
         println!("Transpiled code:\n{code}");
     }
+
+    #[test]
+    fn test_jsx_refresh_registers_components() {
+        let (code, _) = transpile("App.jsx", "export function App() { return <h1>Hello</h1>; }").unwrap();
+        assert!(code.contains("$RefreshReg$"), "{code}");
+        assert!(code.contains("react/jsx-runtime"), "{code}");
+    }
+
+    #[test]
+    fn test_returns_source_map() {
+        let (_, map) = transpile("a.ts", "export const a: number = 1;").unwrap();
+        let map: serde_json::Value = serde_json::from_str(&map.expect("source map")).unwrap();
+        assert_eq!(map["version"], 3);
+        assert!(!map["mappings"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_preserves_imports_and_strips_type_only() {
+        let src = "import type { T } from './types';\nimport { f } from './f';\nexport const x: T = f();";
+        let (code, _) = transpile("a.ts", src).unwrap();
+        assert!(!code.contains("./types"), "{code}");
+        assert!(code.contains("./f"), "{code}");
+    }
+
+    #[test]
+    fn test_unknown_extension_errors() {
+        assert!(transpile("styles.css", "body {}").is_err());
+    }
+
+    #[test]
+    fn test_fatal_parse_error_errors() {
+        assert!(transpile("broken.ts", "const = ;").is_err());
+    }
+
+    #[test]
+    fn test_empty_source_ok() {
+        assert!(transpile("empty.ts", "").is_ok());
+    }
 }

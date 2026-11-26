@@ -10,7 +10,7 @@ use axum::{
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+use notify_debouncer_mini::{new_debouncer_opt, notify, notify::RecursiveMode};
 use std::{
     collections::HashMap,
     net::SocketAddr,
@@ -28,6 +28,8 @@ mod log;
 mod env;
 mod alias;
 mod build;
+#[cfg(test)]
+mod test_util;
 
 #[derive(Clone)]
 struct AppState {
@@ -263,7 +265,9 @@ async fn request_middleware(
     // Helper to register module dependencies into ModuleGraph
     let register_module = |source: &str, fname: &str| {
         let is_accepting = hmr::has_hot_accept(source);
-        let raw_imports = resolve::scan_imports(source, fname);
+        // Scan after alias rewriting so `@/x` imports land in the graph like `./x`.
+        let aliased = alias::resolve_aliases(source, fname, &state.aliases);
+        let raw_imports = resolve::scan_imports(&aliased, fname);
         let parent = Path::new(rel_path).parent().unwrap_or(Path::new(""));
         let mut deps = Vec::new();
         for (spec, _, _) in raw_imports {
@@ -359,7 +363,8 @@ fn is_spa_fallback_request(
     ext: &str,
     headers: &axum::http::HeaderMap,
 ) -> bool {
-    if method != axum::http::Method::GET || path.starts_with("/__") {
+    // "/__*" and "/@*" are internal routes (HMR client, virtual modules), never app pages.
+    if method != axum::http::Method::GET || path.starts_with("/__") || path.starts_with("/@") {
         return false;
     }
     let is_html_req = headers
@@ -438,6 +443,33 @@ fn should_ignore(path: &Path) -> bool {
     })
 }
 
+/// OS watcher that drops access events. inotify reports every open/read, so without this
+/// the server reading a file to serve it would broadcast a reload for that file.
+struct NoAccessWatcher(notify::RecommendedWatcher);
+
+impl notify::Watcher for NoAccessWatcher {
+    fn new<F: notify::EventHandler>(mut handler: F, config: notify::Config) -> notify::Result<Self> {
+        let filter = move |res: notify::Result<notify::Event>| {
+            if !matches!(&res, Ok(e) if e.kind.is_access()) {
+                handler.handle_event(res);
+            }
+        };
+        notify::RecommendedWatcher::new(filter, config).map(Self)
+    }
+
+    fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+        self.0.watch(path, mode)
+    }
+
+    fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+        self.0.unwatch(path)
+    }
+
+    fn kind() -> notify::WatcherKind {
+        notify::RecommendedWatcher::kind()
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = parse_args();
@@ -472,7 +504,8 @@ async fn main() {
     let watcher_graph = graph.clone();
     std::thread::spawn(move || {
         let (sync_tx, sync_rx) = std::sync::mpsc::channel();
-        let mut debouncer = match new_debouncer(Duration::from_millis(50), sync_tx) {
+        let config = notify_debouncer_mini::Config::default().with_timeout(Duration::from_millis(50));
+        let mut debouncer = match new_debouncer_opt::<_, NoAccessWatcher>(config, sync_tx) {
             Ok(d) => d,
             Err(e) => {
                 log::error(&format!("watcher error: {}", e));
@@ -688,6 +721,7 @@ mod tests {
 
         // Internal endpoints should never trigger fallback
         assert!(!is_spa_fallback_request(&Method::GET, "/__hmr", "", &headers));
+        assert!(!is_spa_fallback_request(&Method::GET, "/@react-refresh", "", &headers));
     }
 
     #[test]

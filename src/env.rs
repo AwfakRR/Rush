@@ -79,4 +79,25 @@ mod tests {
         assert!(result.contains("fetch(\"http://localhost:8080\")"));
         assert!(!result.contains("import.meta.env"));
     }
+
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn test_load_env_file_only_exposes_rush_vars() {
+        let dir = TempDir::new();
+        dir.write(
+            ".env",
+            "# comment\n\nRUSH_API=http://localhost:8080\nRUSH_QUOTED=\"hello world\"\nRUSH_SINGLE='single'\n  RUSH_SPACED  =  padded  \nRUSH_EQ=a=b\nDB_PASSWORD=secret\nnot a pair\n",
+        );
+        let env = load_env(dir.path());
+        let get = |k: &str| env.get(&format!("import.meta.env.{k}")).cloned();
+        assert_eq!(get("RUSH_API"), Some("\"http://localhost:8080\"".to_string()));
+        assert_eq!(get("RUSH_QUOTED"), Some("\"hello world\"".to_string()));
+        assert_eq!(get("RUSH_SINGLE"), Some("\"single\"".to_string()));
+        assert_eq!(get("RUSH_SPACED"), Some("\"padded\"".to_string()));
+        assert_eq!(get("RUSH_EQ"), Some("\"a=b\"".to_string()));
+        assert_eq!(get("DB_PASSWORD"), None);
+        assert_eq!(get("PROD"), Some("false".to_string()));
+        assert_eq!(env.len(), 3 + 5);
+    }
 }
