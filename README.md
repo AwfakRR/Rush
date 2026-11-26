@@ -15,6 +15,7 @@
   <a href="#cli-options">CLI Options</a> •
   <a href="#example-project">Example</a> •
   <a href="#architecture--design-philosophy">Architecture & Philosophy</a> •
+  <a href="#testing">Testing</a> •
   <a href="#roadmap">Roadmap</a> •
   <a href="#license">License</a>
 </p>
@@ -151,6 +152,16 @@ Rush is built on **radical pragmatism and first-principles simplicity**: deliver
    - Microsecond on-the-fly AST transformations eliminate the need for complicated, invalidation-prone in-memory file caching layers.
 
 ---
+
+## Testing
+
+```bash
+npm install --prefix example   # esbuild, used by the `rush build` tests
+cargo test
+```
+
+- **Unit tests** (in `src/`): transpilation and source maps, bare-import rewriting and package entry resolution, path aliases, `.env` loading, and the HMR module graph (boundaries, cycles, stale edges).
+- **Integration tests** (in `tests/`): start a real `rush` process on a temp project and check served output, SPA fallback, JSON/asset modules, `--proxy`, the HMR messages sent over `/__hmr` when files change, and `rush build`.
 
 ## Roadmap
 

@@ -92,4 +92,48 @@ import React from 'react';"#;
         // Bare import should be untouched
         assert!(result.contains(r#"from 'react'"#));
     }
+
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn test_load_aliases_from_tsconfig_sorted_longest_first() {
+        let dir = TempDir::new();
+        dir.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@components/*":["./src/components/*","./fallback/*"],"~/*":["./lib/*"]}}}"#,
+        );
+        let aliases = load_aliases(dir.path());
+        assert_eq!(aliases[0], ("@components/".to_string(), "./src/components/".to_string()));
+        assert_eq!(aliases.len(), 3);
+        assert!(aliases.contains(&("@/".to_string(), "./src/".to_string())));
+        assert!(aliases.contains(&("~/".to_string(), "./lib/".to_string())));
+    }
+
+    #[test]
+    fn test_load_aliases_tolerates_bad_tsconfig() {
+        let dir = TempDir::new();
+        dir.write("tsconfig.json", "{ invalid json");
+        assert!(load_aliases(dir.path()).is_empty());
+        dir.write("tsconfig.json", r#"{"compilerOptions":{"strict":true}}"#);
+        assert!(load_aliases(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn test_resolve_aliases_longest_prefix_wins() {
+        let dir = TempDir::new();
+        dir.write(
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@/*":["./src/*"],"@components/*":["./ui/*"]}}}"#,
+        );
+        let aliases = load_aliases(dir.path());
+        let out = resolve_aliases("import B from '@components/Button';\nimport u from '@/util';", "a.ts", &aliases);
+        assert!(out.contains(r#"from "./ui/Button""#));
+        assert!(out.contains(r#"from "./src/util""#));
+    }
+
+    #[test]
+    fn test_resolve_aliases_no_aliases_is_identity() {
+        let code = "import x from '@/x';";
+        assert_eq!(resolve_aliases(code, "a.ts", &[]), code);
+    }
 }

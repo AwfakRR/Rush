@@ -217,4 +217,30 @@ mod tests {
         let links = extract_css_links(html);
         assert_eq!(links, vec!["/style.css".to_string()]);
     }
+
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn test_extract_script_entry_skips_non_module_scripts() {
+        let html = r#"<script src="/legacy.js"></script><script async type="module" src='/src/main.ts'></script>"#;
+        assert_eq!(extract_script_entry(html), Some("/src/main.ts".to_string()));
+    }
+
+    #[test]
+    fn test_extract_css_links_multiple_and_single_quotes() {
+        let html = r#"<link rel='stylesheet' href='/a.css'><link href="/b.css"><link rel="stylesheet" href="https://cdn/x.css">"#;
+        assert_eq!(extract_css_links(html), vec!["/a.css".to_string(), "https://cdn/x.css".to_string()]);
+    }
+
+    #[test]
+    fn test_run_build_errors() {
+        let dir = TempDir::new();
+        assert!(run_build(dir.path()).unwrap_err().contains("index.html not found"));
+
+        dir.write("index.html", "<html><body></body></html>");
+        assert!(run_build(dir.path()).unwrap_err().contains("<script type=\"module\""));
+
+        dir.write("index.html", r#"<script type="module" src="/missing.js"></script>"#);
+        assert!(run_build(dir.path()).unwrap_err().contains("entry script file not found"));
+    }
 }

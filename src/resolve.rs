@@ -386,4 +386,158 @@ export * from 'lodash-es';"#;
         // In this project root, there is Cargo.lock, not yarn or pnpm, so defaults to npm
         assert_eq!(detect_package_manager(Path::new(".")), "npm");
     }
+
+    use crate::test_util::TempDir;
+
+    #[test]
+    fn test_dep_url() {
+        assert_eq!(dep_url("/deps/", "react"), "/deps/react.js");
+        assert_eq!(dep_url("/deps", "@scope/pkg"), "/deps/@scope__pkg.js");
+        assert_eq!(dep_url("/deps", "react-dom/client"), "/deps/react-dom__client.js");
+    }
+
+    #[test]
+    fn test_scan_imports_spans_cover_quoted_specifier() {
+        let code = "import a from 'a';\nexport * from \"./b\";\nexport const x = 1;\nimport('./lazy.js');";
+        let imports = scan_imports(code, "x.js");
+        let specs: Vec<&str> = imports.iter().map(|(s, _, _)| s.as_str()).collect();
+        // Only static import / export-all declarations are scanned.
+        assert_eq!(specs, vec!["a", "./b"]);
+        for (spec, start, end) in &imports {
+            let slice = &code[*start as usize..*end as usize];
+            assert_eq!(&slice[1..slice.len() - 1], spec);
+        }
+    }
+
+    #[test]
+    fn test_scan_imports_typescript_and_side_effect() {
+        let code = "import type { T } from './types';\nimport './polyfill';\nimport { h } from 'preact';\nconst n: number = 1;";
+        let specs: Vec<String> = scan_imports(code, "x.ts").into_iter().map(|(s, _, _)| s).collect();
+        assert_eq!(specs, vec!["./types", "./polyfill", "preact"]);
+    }
+
+    #[test]
+    fn test_rewrite_bare_imports_leaves_non_bare_untouched() {
+        let code = "import x from '/abs.js';\nimport y from 'https://esm.sh/y';\nimport z from '../z.js';";
+        assert_eq!(rewrite_bare_imports(code, "app.js", "/deps"), code);
+    }
+
+    #[test]
+    fn test_rewrite_bare_imports_subpath_and_multiple() {
+        let code = "import { createRoot } from 'react-dom/client';\nimport React from 'react';\nimport './a.css.js';";
+        let out = rewrite_bare_imports(code, "app.jsx", "/deps");
+        assert!(out.contains(r#"from "/deps/react-dom__client.js";"#));
+        assert!(out.contains(r#"from "/deps/react.js";"#));
+        assert!(out.contains("import './a.css.js';"));
+    }
+
+    fn pkg(dir: &TempDir, name: &str, json: &str) {
+        dir.write(&format!("node_modules/{name}/package.json"), json);
+    }
+
+    #[test]
+    fn test_resolve_package_entry_field_precedence() {
+        let dir = TempDir::new();
+        let root = dir.path();
+        pkg(&dir, "exp-import", r#"{"exports":{".":{"import":"./esm.js","default":"./cjs.js"}},"module":"./m.js","main":"./main.js"}"#);
+        pkg(&dir, "exp-default", r#"{"exports":{".":{"default":"./d.js"}}}"#);
+        pkg(&dir, "exp-browser", r#"{"exports":{".":{"browser":"./b.js"}}}"#);
+        pkg(&dir, "exp-dot-string", r#"{"exports":{".":"./dot.js"}}"#);
+        pkg(&dir, "exp-string", r#"{"exports":"./s.js","main":"./main.js"}"#);
+        pkg(&dir, "module-field", r#"{"module":"./m.js","main":"./main.js"}"#);
+        pkg(&dir, "main-field", r#"{"main":"./main.js"}"#);
+        pkg(&dir, "@scope/pkg", r#"{"main":"./scoped.js"}"#);
+
+        let entry = |n: &str| resolve_package_entry(root, n).map(|p| p.strip_prefix(root.join("node_modules")).unwrap().to_path_buf());
+        assert_eq!(entry("exp-import"), Some(Path::new("exp-import/./esm.js").to_path_buf()));
+        assert_eq!(entry("exp-default"), Some(Path::new("exp-default/./d.js").to_path_buf()));
+        assert_eq!(entry("exp-browser"), Some(Path::new("exp-browser/./b.js").to_path_buf()));
+        assert_eq!(entry("exp-dot-string"), Some(Path::new("exp-dot-string/./dot.js").to_path_buf()));
+        assert_eq!(entry("exp-string"), Some(Path::new("exp-string/./s.js").to_path_buf()));
+        assert_eq!(entry("module-field"), Some(Path::new("module-field/./m.js").to_path_buf()));
+        assert_eq!(entry("main-field"), Some(Path::new("main-field/./main.js").to_path_buf()));
+        assert_eq!(entry("@scope/pkg"), Some(Path::new("@scope/pkg/./scoped.js").to_path_buf()));
+    }
+
+    #[test]
+    fn test_resolve_package_entry_index_fallback_and_missing() {
+        let dir = TempDir::new();
+        pkg(&dir, "bare-index", r#"{"name":"bare-index"}"#);
+        pkg(&dir, "no-entry", r#"{"name":"no-entry"}"#);
+        dir.write("node_modules/bare-index/index.js", "export default 1;");
+        dir.write("node_modules/broken/package.json", "{ not json");
+
+        assert_eq!(
+            resolve_package_entry(dir.path(), "bare-index"),
+            Some(dir.path().join("node_modules/bare-index/index.js"))
+        );
+        assert_eq!(resolve_package_entry(dir.path(), "no-entry"), None);
+        assert_eq!(resolve_package_entry(dir.path(), "broken"), None);
+        assert_eq!(resolve_package_entry(dir.path(), "not-installed"), None);
+    }
+
+    #[test]
+    fn test_lockfile_hash_changes_with_lockfiles() {
+        let dir = TempDir::new();
+        let empty = lockfile_hash(dir.path());
+        dir.write("package.json", r#"{"dependencies":{"a":"1"}}"#);
+        let with_pkg = lockfile_hash(dir.path());
+        assert_ne!(empty, with_pkg);
+        dir.write("package-lock.json", "{}");
+        assert_ne!(with_pkg, lockfile_hash(dir.path()));
+        assert_eq!(lockfile_hash(dir.path()), lockfile_hash(dir.path()));
+    }
+
+    #[test]
+    fn test_scan_dir_skips_noise_dirs() {
+        let dir = TempDir::new();
+        dir.write("src/a.ts", "import x from 'from-src';\nimport y from './local';");
+        dir.write("src/deep/b.jsx", "export * from 'from-deep';");
+        dir.write("node_modules/pkg/index.js", "import z from 'from-node-modules';");
+        dir.write(".cache/c.js", "import z from 'from-dot-dir';");
+        dir.write("target/d.js", "import z from 'from-target';");
+        dir.write("notes.md", "import z from 'from-markdown';");
+
+        let mut bare = HashSet::new();
+        scan_dir_for_bare_imports(dir.path(), dir.path(), &mut bare);
+        let mut found: Vec<_> = bare.into_iter().collect();
+        found.sort();
+        assert_eq!(found, vec!["from-deep", "from-src"]);
+    }
+
+    #[test]
+    fn test_detect_package_manager_lockfiles() {
+        let cases = [
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("bun.lockb", "bun"),
+            ("bun.lock", "bun"),
+            ("package-lock.json", "npm"),
+        ];
+        for (lockfile, expected) in cases {
+            let dir = TempDir::new();
+            dir.write(lockfile, "");
+            assert_eq!(detect_package_manager(dir.path()), expected, "{lockfile}");
+        }
+    }
+
+    #[test]
+    fn test_prebundle_without_bare_imports_is_noop() {
+        let dir = TempDir::new();
+        dir.write("main.js", "import './local.js';");
+        assert!(prebundle(dir.path()).unwrap().is_none());
+        assert!(!dir.path().join("node_modules/.rush").exists());
+    }
+
+    #[test]
+    fn test_prebundle_uses_fresh_cache() {
+        let dir = TempDir::new();
+        dir.write("main.js", "import a from 'a';");
+        let cache = DepCache { hash: lockfile_hash(dir.path()), deps: vec!["a".to_string()] };
+        dir.write("node_modules/.rush/deps/_cache.json", &serde_json::to_string(&cache).unwrap());
+        // Fresh cache short-circuits before esbuild or auto-install would run.
+        let got = prebundle(dir.path()).unwrap().unwrap();
+        assert_eq!(got.deps, vec!["a".to_string()]);
+        assert_eq!(got.hash, cache.hash);
+    }
 }
